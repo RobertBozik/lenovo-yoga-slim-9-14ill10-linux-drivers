@@ -1,4 +1,4 @@
-# Lenovo Yoga Slim 9 14ILL10 (83CX) on Linux — OmniVision OV32C4 webcam driver, ALC287 speaker fix, Xe display fix
+# Lenovo Yoga Slim 9 14ILL10 (83CX) Linux drivers — OmniVision OV32C4 webcam, ALC287 speakers, Xe display
 
 Three things do not work on this laptop under Linux out of the box: the
 webcam does not exist at all, only the tweeters play, and the screen
@@ -7,8 +7,8 @@ blanks for a moment during video calls. This repository fixes all three.
 Clone it, run one command, reboot.
 
 ```sh
-git clone https://github.com/RobertBozik/lenovo-yoga-slim-9-14ill10-ov32c4-linux.git
-cd lenovo-yoga-slim-9-14ill10-ov32c4-linux
+git clone https://github.com/RobertBozik/lenovo-yoga-slim-9-14ill10-linux-drivers.git
+cd lenovo-yoga-slim-9-14ill10-linux-drivers
 sudo bash install.sh
 sudo reboot
 ```
