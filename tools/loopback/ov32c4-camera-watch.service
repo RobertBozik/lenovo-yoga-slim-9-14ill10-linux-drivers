@@ -1,0 +1,14 @@
+# Užívateľská služba: feeder pre v4l2loopback na požiadanie (kap. 44).
+# Inštaluje sa do /etc/systemd/user/ a zapína `systemctl --user enable`.
+[Unit]
+Description=OV32C4 loopback camera feeder watcher
+# Uzol vytvára modul pri boote; ak chýba, služba to vypíše a skončí.
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/ov32c4-camera-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

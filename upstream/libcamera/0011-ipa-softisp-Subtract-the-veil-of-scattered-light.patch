@@ -1,0 +1,209 @@
+From 5d715365b7ae2a50f55477396773bec943c2eb92 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Wed, 26 Aug 2026 16:15:44 +0000
+Subject: [PATCH] ipa: softisp: Subtract the veil of scattered light
+
+Light scattered by the optics, or by a display panel in front of them,
+adds a roughly uniform veil to the frame. It lifts the blacks and fades
+the colours, and the digital gain a dark scene needs then amplifies it:
+on the OV32C4 behind the OLED panel the darkest percentile of a room
+scene sits at 50/255 where a phone camera puts it at 7.
+
+Let the BlackLevel algorithm subtract it: veilStrength (0 disables) is
+the fraction of the luminance of the veilPercentile darkest pixels that
+is treated as veil, bounded by veilMax. The veil is assumed neutral, so
+it is subtracted per channel in proportion to the inverse white balance
+gains, on top of the black level, and smoothed over frames.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/blc.cpp | 102 ++++++++++++++++++++++++++++-
+ src/ipa/softisp/algorithms/blc.h   |   6 ++
+ src/ipa/softisp/ipa_context.h      |   2 +
+ 3 files changed, 109 insertions(+), 1 deletion(-)
+
+diff --git a/src/ipa/softisp/algorithms/blc.cpp b/src/ipa/softisp/algorithms/blc.cpp
+index e35aabc..f190de6 100644
+--- a/src/ipa/softisp/algorithms/blc.cpp
++++ b/src/ipa/softisp/algorithms/blc.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "blc.h"
+ 
++#include <algorithm>
+ #include <numeric>
+ 
+ #include <libcamera/base/log.h>
+@@ -23,9 +24,35 @@ BlackLevel::BlackLevel()
+ {
+ }
+ 
++/*
++ * Light scattered by the optics (or by a display panel in front of them)
++ * adds a roughly uniform veil to the whole frame, which lifts the blacks
++ * and fades the colours, and which the digital gain of a dark scene then
++ * amplifies. The tuning file can subtract it: veilStrength (0 disables) is
++ * the fraction of the luminance of the veilPercentile darkest pixels that
++ * is treated as veil, bounded by veilMax in normalised linear units. The
++ * veil is assumed neutral, so it is subtracted per channel in proportion
++ * to the inverse of the white balance gains, and smoothed over frames.
++ */
++static constexpr double kDefaultVeilPercentile = 0.5;
++static constexpr double kDefaultVeilMax = 0.05;
++static constexpr double kVeilSmoothing = 0.1;
++
+ int BlackLevel::init([[maybe_unused]] IPAContext &context,
+ 		     const ValueNode &tuningData)
+ {
++	veilStrength_ = tuningData["veilStrength"].get<double>(0.0);
++	veilPercentile_ = tuningData["veilPercentile"].get<double>(kDefaultVeilPercentile);
++	veilMax_ = tuningData["veilMax"].get<double>(kDefaultVeilMax);
++	if (veilStrength_ < 0.0 || veilStrength_ > 1.0 ||
++	    veilPercentile_ <= 0.0 || veilPercentile_ >= 100.0 ||
++	    veilMax_ < 0.0 || veilMax_ > 0.5) {
++		LOG(IPASoftIspBL, Warning)
++			<< "veilStrength must be in [0, 1], veilPercentile in ]0, 100[ "
++			<< "and veilMax in [0, 0.5], veil subtraction disabled";
++		veilStrength_ = 0.0;
++	}
++
+ 	auto blackLevel = tuningData["blackLevel"].get<int16_t>();
+ 	if (blackLevel.has_value()) {
+ 		/*
+@@ -44,6 +71,7 @@ int BlackLevel::configure(IPAContext &context,
+ 		context.configuration.black.level = definedLevel_;
+ 	context.activeState.blc.level =
+ 		context.configuration.black.level.value_or(16);
++	context.activeState.blc.veil = 0.0;
+ 	return 0;
+ }
+ 
+@@ -53,7 +81,24 @@ void BlackLevel::prepare(IPAContext &context,
+ 			 DebayerParams *params)
+ {
+ 	/* Latch the blacklevel gain so GPUISP can apply. */
+-	params->blackLevel = RGB<double>(context.activeState.blc.level / 255.0f);
++	const double level = context.activeState.blc.level / 255.0;
++	params->blackLevel = RGB<double>(level);
++
++	/*
++	 * The veil is expressed after the white balance; the ISP subtracts
++	 * the black level before it, so scale it back per channel with the
++	 * gains the AWB is going to apply.
++	 */
++	const double veil = context.activeState.blc.veil;
++	if (veil > 0.0) {
++		const auto &awb = context.activeState.awb;
++		const RGB<double> &gains = awb.autoEnabled ? awb.automatic.gains
++							   : awb.manual.gains;
++		for (unsigned int c = 0; c < 3; c++) {
++			const double gain = std::max(gains[c], 1e-3);
++			params->blackLevel[c] = std::min(level + (1.0 - level) * veil / gain, 0.5);
++		}
++	}
+ }
+ 
+ void BlackLevel::process(IPAContext &context,
+@@ -72,6 +117,9 @@ void BlackLevel::process(IPAContext &context,
+ 	if (!stats->valid)
+ 		return;
+ 
++	if (veilStrength_ > 0.0)
++		updateVeil(context, frameContext, stats);
++
+ 	if (context.configuration.black.level.has_value())
+ 		return;
+ 
+@@ -117,6 +165,58 @@ void BlackLevel::process(IPAContext &context,
+ 	};
+ }
+ 
++void BlackLevel::updateVeil(IPAContext &context, IPAFrameContext &frameContext,
++			    const SwIspStats *stats)
++{
++	const SwIspStats::Histogram &histogram = stats->yHistogram;
++	const unsigned int histogramRatio = 256 / SwIspStats::kYHistogramSize;
++	const unsigned int blackIdx = std::min<unsigned int>(
++		context.activeState.blc.level / histogramRatio,
++		SwIspStats::kYHistogramSize - 1);
++	const unsigned int size = SwIspStats::kYHistogramSize - blackIdx;
++
++	unsigned int total = 0;
++	for (unsigned int i = 0; i < size; i++)
++		total += histogram[blackIdx + i];
++	if (total == 0)
++		return;
++
++	/*
++	 * Position of the percentile inside its bin, assuming the pixels are
++	 * spread evenly over the bin: the bins are coarse for a dark scene.
++	 */
++	const unsigned int below = static_cast<unsigned int>(total * veilPercentile_ / 100.0);
++	unsigned int seen = 0;
++	double position = 0.0;
++	for (unsigned int i = 0; i < size; i++) {
++		const unsigned int count = histogram[blackIdx + i];
++		if (seen + count > below) {
++			position = i + static_cast<double>(below - seen) / std::max(count, 1u);
++			break;
++		}
++		seen += count;
++	}
++
++	/*
++	 * The histogram is computed on the raw data. A neutral veil has the
++	 * raw luminance of a grey patch, the weighted sum of the inverse
++	 * white balance gains.
++	 */
++	const RGB<double> &gains = frameContext.awb.gains;
++	const double neutral = 0.299 / std::max(gains.r(), 1e-3) +
++			       0.587 / std::max(gains.g(), 1e-3) +
++			       0.114 / std::max(gains.b(), 1e-3);
++	double veil = position / size / neutral * veilStrength_;
++	veil = std::clamp(veil, 0.0, veilMax_);
++
++	double &state = context.activeState.blc.veil;
++	state += (veil - state) * kVeilSmoothing;
++
++	LOG(IPASoftIspBL, Debug)
++		<< "Veil percentile at " << position << "/" << size
++		<< " veil " << veil << " smoothed " << state;
++}
++
+ REGISTER_IPA_ALGORITHM(BlackLevel, "BlackLevel")
+ 
+ } /* namespace ipa::softisp::algorithms */
+diff --git a/src/ipa/softisp/algorithms/blc.h b/src/ipa/softisp/algorithms/blc.h
+index 1d60292..16e20a2 100644
+--- a/src/ipa/softisp/algorithms/blc.h
++++ b/src/ipa/softisp/algorithms/blc.h
+@@ -34,7 +34,13 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
++	void updateVeil(IPAContext &context, IPAFrameContext &frameContext,
++			const SwIspStats *stats);
++
+ 	std::optional<uint8_t> definedLevel_;
++	double veilStrength_;
++	double veilPercentile_;
++	double veilMax_;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */
+diff --git a/src/ipa/softisp/ipa_context.h b/src/ipa/softisp/ipa_context.h
+index de188f1..12a7a82 100644
+--- a/src/ipa/softisp/ipa_context.h
++++ b/src/ipa/softisp/ipa_context.h
+@@ -68,6 +68,8 @@ struct IPAActiveState {
+ 		uint8_t level;
+ 		int32_t lastExposure;
+ 		double lastGain;
++		/* Veil subtracted on top of the black level, white balanced units */
++		double veil;
+ 	} blc;
+ 
+ 	Matrix<float, 3, 3> combinedMatrix;
+-- 
+2.43.0
+

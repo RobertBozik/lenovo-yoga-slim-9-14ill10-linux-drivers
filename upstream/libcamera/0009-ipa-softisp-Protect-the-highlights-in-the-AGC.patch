@@ -1,0 +1,192 @@
+From d97bfaa53ee0777f14a72917fc82d4c193b64494 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Wed, 26 Aug 2026 15:50:16 +0000
+Subject: [PATCH 09/10] ipa: softisp: Protect the highlights in the AGC
+
+The AGC aims at the middle of the linear luminance histogram, which is
+brighter than most scenes tolerate once the gain to get there is
+available: with a digital gain in the ISP, a white wall behind the user
+clips long before the mean sample value reaches its target.
+
+Let the tuning file bound the gain with highlightLevel: the luminance of
+the highlightPercentile of the pixels, scaled by the digital and white
+balance gains, is kept below that level in normalised linear units. The
+percentile is located inside its histogram bin assuming an even spread,
+as the bins are coarse for the signal of a dark scene. Gain already past
+the level is pulled back down. The default of 0 keeps the current
+behaviour.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/agc.cpp | 84 ++++++++++++++++++++++++++++--
+ src/ipa/softisp/algorithms/agc.h   |  5 +-
+ 2 files changed, 85 insertions(+), 4 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index 0037fa6..e9f82be 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <limits>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -84,6 +85,17 @@ static constexpr float kExpMaxJump = 2.0;
+  */
+ static constexpr double kDefaultMaxDigitalGain = 1.0;
+ 
++/*
++ * The MSV target sits in the middle of the linear histogram, which is
++ * bright enough to clip the brightest parts of many scenes once the gain
++ * is available. The tuning file can protect them with highlightLevel: the
++ * gain is then bounded so that the highlightPercentile of the luminance
++ * (after the digital and white balance gains) stays below that level,
++ * in normalised linear units. 0 disables the protection.
++ */
++static constexpr double kDefaultHighlightLevel = 0.0;
++static constexpr double kDefaultHighlightPercentile = 99.0;
++
+ /*
+  * Applications that don't set FrameDurationLimits get the full range the
+  * sensor supports, which lets the AGC slow the frame rate down to whatever
+@@ -100,6 +112,15 @@ Agc::Agc()
+ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
+ 	maxDigitalGain_ = tuningData["maxDigitalGain"].get<double>(kDefaultMaxDigitalGain);
++	highlightLevel_ = tuningData["highlightLevel"].get<double>(kDefaultHighlightLevel);
++	highlightPercentile_ = tuningData["highlightPercentile"].get<double>(kDefaultHighlightPercentile);
++	if (highlightLevel_ < 0.0 || highlightLevel_ > 1.0 ||
++	    highlightPercentile_ <= 0.0 || highlightPercentile_ > 100.0) {
++		LOG(IPASoftIspExposure, Warning)
++			<< "highlightLevel must be in [0, 1] and highlightPercentile in ]0, 100], ignored";
++		highlightLevel_ = kDefaultHighlightLevel;
++		highlightPercentile_ = kDefaultHighlightPercentile;
++	}
+ 
+ 	const auto tuningMaxFrameDuration = tuningData["maxFrameDuration"].get<uint32_t>();
+ 	if (tuningMaxFrameDuration) {
+@@ -259,7 +280,8 @@ int32_t Agc::exposureMaxForVblank(const IPAContext &context, int32_t vblank) con
+ 			static_cast<int32_t>(cfg.frameHeight) + vblank - cfg.exposureMargin);
+ }
+ 
+-void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV)
++void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			 double exposureMSV, double highlight)
+ {
+ 	int32_t &exposure = frameContext.sensor.exposure;
+ 	double &again = frameContext.sensor.gain;
+@@ -279,7 +301,18 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 
+ 	double error = kExposureOptimal - exposureMSV;
+ 
+-	if (std::abs(error) <= kExposureSatisfactory) {
++	/*
++	 * The highlights are protected by bounding the correction factor,
++	 * and by pulling the gain down when they are already clipped.
++	 */
++	double factorMax = std::numeric_limits<double>::infinity();
++	if (highlightLevel_ > 0.0 && highlight > 0.0) {
++		factorMax = highlightLevel_ / highlight;
++		if (factorMax < 1.0 && error > -kExposureSatisfactory)
++			error = std::min(error, -2.0 * kExposureSatisfactory);
++	}
++
++	if (std::abs(error) <= kExposureSatisfactory || (error > 0.0 && factorMax <= 1.0)) {
+ 		/* Still honour changed frame duration limits. */
+ 		exposure = std::clamp(exposure, context.configuration.agc.exposureMin,
+ 				      exposureMax);
+@@ -307,6 +340,11 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 		factor = 1.0f + step;
+ 	}
+ 
++	if (factor > 1.0f)
++		factor = std::min(factor, static_cast<float>(factorMax));
++	else if (factorMax < 1.0)
++		factor = std::min(factor, static_cast<float>(factorMax));
++
+ 	if (factor > 1.0f) {
+ 		/*
+ 		 * Scene too dark: increase exposure first (lengthening the
+@@ -361,6 +399,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 
+ 	LOG(IPASoftIspExposure, Debug)
+ 		<< "exposureMSV " << exposureMSV
++		<< " highlight " << highlight << " factorMax " << factorMax
+ 		<< " error " << error << " factor " << factor
+ 		<< " exp " << exposure << " again " << again
+ 		<< " dgain " << dgain
+@@ -450,7 +489,46 @@ void Agc::process(IPAContext &context,
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+-	updateExposure(context, frameContext, exposureMSV);
++
++	/*
++	 * Luminance of the highlightPercentile of the pixels as the ISP
++	 * outputs it, in normalised linear units: the histogram bin above
++	 * the black level, scaled by the digital gain and by the white
++	 * balance gains assuming a neutral highlight (the raw luminance of a
++	 * grey patch is the weighted sum of the inverse gains).
++	 */
++	double highlight = 0.0;
++	if (highlightLevel_ > 0.0) {
++		unsigned int total = 0;
++		for (unsigned int i = 0; i < histogramSize; i++)
++			total += histogram[blackLevelHistIdx + i];
++
++		const unsigned int above = static_cast<unsigned int>(
++			total * (100.0 - highlightPercentile_) / 100.0);
++		/*
++		 * The bins are coarse compared to the signal of a dark scene,
++		 * so locate the percentile inside its bin assuming the pixels
++		 * are spread evenly over the bin.
++		 */
++		unsigned int seen = 0;
++		double position = histogramSize;
++		for (unsigned int i = histogramSize; i > 0; i--) {
++			const unsigned int count = histogram[blackLevelHistIdx + i - 1];
++			if (seen + count > above) {
++				position = i - static_cast<double>(above - seen) / std::max(count, 1u);
++				break;
++			}
++			seen += count;
++		}
++
++		const RGB<double> &gains = frameContext.awb.gains;
++		double neutral = 0.299 / std::max(gains.r(), 1e-3) +
++				 0.587 / std::max(gains.g(), 1e-3) +
++				 0.114 / std::max(gains.b(), 1e-3);
++		highlight = position / histogramSize * digitalGain / neutral;
++	}
++
++	updateExposure(context, frameContext, exposureMSV, highlight);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Agc, "Agc")
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index ad732b1..7e600f8 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -37,12 +37,15 @@ public:
+ 		     ControlList &metadata) override;
+ 
+ private:
+-	void updateExposure(IPAContext &context, IPAFrameContext &frameContext, double exposureMSV);
++	void updateExposure(IPAContext &context, IPAFrameContext &frameContext,
++			    double exposureMSV, double highlight);
+ 	void vblankRange(const IPAContext &context, const IPAFrameContext &frameContext,
+ 			 int32_t &vblankLo, int32_t &vblankHi) const;
+ 	int32_t exposureMaxForVblank(const IPAContext &context, int32_t vblank) const;
+ 
+ 	double maxDigitalGain_;
++	double highlightLevel_;
++	double highlightPercentile_;
+ 	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+ 
+-- 
+2.43.0
+

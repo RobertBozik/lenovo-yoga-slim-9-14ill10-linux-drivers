@@ -1,0 +1,243 @@
+From 0ca95838b15b9d7029457fa8e5fefc13e8d2c9d9 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Wed, 26 Aug 2026 15:50:17 +0000
+Subject: [PATCH 10/10] libcamera: software_isp: Add a linear toe to the gamma
+ curve
+
+A plain power function has an infinite slope at zero, so the darkest
+tones get the largest amplification: the noise and the positive bias
+left by clipping the noise at the black level end up as a grey-green
+veil over the shadows of a dark scene.
+
+Let the tuning file add a linear segment near black with gammaOffset,
+in the style of the sRGB transfer function: the curve becomes
+(1 + offset) * x ^ (1 / gamma) - offset above the point where its slope
+matches the line through the origin, and that line below it. The IPA
+computes the threshold and the slope, both debayers apply them. The
+default offset of 0 keeps the plain power function.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ .../internal/software_isp/debayer_params.h    |  9 +++++
+ src/ipa/softisp/algorithms/adjust.cpp         | 33 ++++++++++++++++++-
+ src/ipa/softisp/algorithms/adjust.h           |  2 ++
+ src/libcamera/shaders/bayer_1x_packed.frag    |  6 +++-
+ src/libcamera/shaders/bayer_unpacked.frag     |  6 +++-
+ src/libcamera/software_isp/debayer_cpu.cpp    | 10 +++++-
+ src/libcamera/software_isp/debayer_egl.cpp    | 10 +++++-
+ src/libcamera/software_isp/debayer_egl.h      |  3 ++
+ 8 files changed, 74 insertions(+), 5 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index cb59b2c..dce3849 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -23,6 +23,15 @@ struct DebayerParams {
+ 						 0.0, 0.0, 1.0 } };
+ 	RGB<double> blackLevel = RGB<double>({ 0.0, 0.0, 0.0 });
+ 	float gamma = 1.0;
++	/*
++	 * Linear toe of the gamma curve, sRGB style: below toeThreshold the
++	 * output is toeSlope * input, above it (1 + gammaOffset) * input ^
++	 * gamma - gammaOffset. A gammaOffset of 0 gives the plain power
++	 * function.
++	 */
++	float gammaOffset = 0.0;
++	float toeThreshold = 0.0;
++	float toeSlope = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<double> gains = RGB<double>({ 1.0, 1.0, 1.0 });
+ 	/*
+diff --git a/src/ipa/softisp/algorithms/adjust.cpp b/src/ipa/softisp/algorithms/adjust.cpp
+index 56e2cf0..5aaf115 100644
+--- a/src/ipa/softisp/algorithms/adjust.cpp
++++ b/src/ipa/softisp/algorithms/adjust.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include "adjust.h"
+ 
++#include <cmath>
++
+ #include <libcamera/base/log.h>
+ #include <libcamera/base/utils.h>
+ 
+@@ -24,8 +26,26 @@ constexpr float kDefaultSaturation = 1.0f;
+ 
+ LOG_DEFINE_CATEGORY(IPASoftIspAdjust)
+ 
+-int Adjust::init(IPAContext &context, [[maybe_unused]] const ValueNode &tuningData)
++/*
++ * A plain power function has an infinite slope at zero, which amplifies the
++ * noise and the clipping bias of the darkest tones. The tuning file can add
++ * a linear toe to the curve with gammaOffset, in the style of the sRGB
++ * transfer function (whose offset is 0.055): the curve becomes
++ * (1 + offset) * x ^ (1 / gamma) - offset above the threshold where its
++ * slope matches the linear segment through the origin, and that linear
++ * segment below it.
++ */
++static constexpr float kDefaultGammaOffset = 0.0f;
++
++int Adjust::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	gammaOffset_ = tuningData["gammaOffset"].get<double>(kDefaultGammaOffset);
++	if (gammaOffset_ < 0.0f || gammaOffset_ >= 1.0f) {
++		LOG(IPASoftIspAdjust, Warning)
++			<< "gammaOffset must be in [0, 1[, ignored";
++		gammaOffset_ = kDefaultGammaOffset;
++	}
++
+ 	context.ctrlMap[&controls::Gamma] =
+ 		ControlInfo(0.1f, 10.0f, kDefaultGamma);
+ 	context.ctrlMap[&controls::Contrast] =
+@@ -107,6 +127,17 @@ void Adjust::prepare(IPAContext &context,
+ 	}
+ 
+ 	params->gamma = 1.0 / context.activeState.knobs.gamma;
++	params->gammaOffset = 0.0f;
++	params->toeThreshold = 0.0f;
++	params->toeSlope = 1.0f;
++	if (gammaOffset_ > 0.0f && params->gamma < 1.0f) {
++		const double a = gammaOffset_;
++		const double g = params->gamma;
++		const double t = std::pow(a / ((1.0 + a) * (1.0 - g)), 1.0 / g);
++		params->gammaOffset = a;
++		params->toeThreshold = t;
++		params->toeSlope = ((1.0 + a) * std::pow(t, g) - a) / t;
++	}
+ 	const float contrast = context.activeState.knobs.contrast.value_or(kDefaultContrast);
+ 	params->contrastExp = tan(std::clamp(contrast * M_PI_4, 0.0, M_PI_2 - 0.00001));
+ }
+diff --git a/src/ipa/softisp/algorithms/adjust.h b/src/ipa/softisp/algorithms/adjust.h
+index 1acf7cd..83b7e10 100644
+--- a/src/ipa/softisp/algorithms/adjust.h
++++ b/src/ipa/softisp/algorithms/adjust.h
+@@ -43,6 +43,8 @@ public:
+ 
+ private:
+ 	void applySaturation(Matrix<float, 3, 3> &ccm, float saturation);
++
++	float gammaOffset_;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */
+diff --git a/src/libcamera/shaders/bayer_1x_packed.frag b/src/libcamera/shaders/bayer_1x_packed.frag
+index 4a98506..a55c8c1 100644
+--- a/src/libcamera/shaders/bayer_1x_packed.frag
++++ b/src/libcamera/shaders/bayer_1x_packed.frag
+@@ -69,6 +69,9 @@ uniform vec3 awb;
+ uniform mat3 ccm;
+ uniform vec3 blacklevel;
+ uniform float gamma;
++uniform float gammaOffset;
++uniform float toeThreshold;
++uniform float toeSlope;
+ uniform float contrastExp;
+ /*
+  * Lens shading: gains on a coarse grid, one texel per cell, stored as
+@@ -259,7 +262,8 @@ void main(void)
+ 	rgb.b = apply_contrast(rgb.b);
+ 
+ 	/* Apply gamma after colour correction */
+-	rgb = pow(rgb, vec3(gamma));
++	rgb = mix((1.0 + gammaOffset) * pow(rgb, vec3(gamma)) - gammaOffset,
++	          toeSlope * rgb, step(rgb, vec3(toeThreshold)));
+ 
+ #if defined (SWAP_BLUE)
+ 	gl_FragColor = vec4(rgb.bgr, 1.0);
+diff --git a/src/libcamera/shaders/bayer_unpacked.frag b/src/libcamera/shaders/bayer_unpacked.frag
+index 566b5d4..8f2f6ee 100644
+--- a/src/libcamera/shaders/bayer_unpacked.frag
++++ b/src/libcamera/shaders/bayer_unpacked.frag
+@@ -29,6 +29,9 @@ uniform vec3            awb;
+ uniform mat3            ccm;
+ uniform vec3            blacklevel;
+ uniform float           gamma;
++uniform float           gammaOffset;
++uniform float           toeThreshold;
++uniform float           toeSlope;
+ uniform float           contrastExp;
+ /*
+  * Lens shading: gains on a coarse grid, one texel per cell, stored as
+@@ -162,7 +165,8 @@ void main(void) {
+     rgb.b = apply_contrast(rgb.b);
+ 
+     /* Apply gamma after colour correction */
+-    rgb = pow(rgb, vec3(gamma));
++    rgb = mix((1.0 + gammaOffset) * pow(rgb, vec3(gamma)) - gammaOffset,
++              toeSlope * rgb, step(rgb, vec3(toeThreshold)));
+ 
+ #if defined (SWAP_BLUE)
+     gl_FragColor = vec4(rgb.bgr, 1.0);
+diff --git a/src/libcamera/software_isp/debayer_cpu.cpp b/src/libcamera/software_isp/debayer_cpu.cpp
+index 43597a4..4372a70 100644
+--- a/src/libcamera/software_isp/debayer_cpu.cpp
++++ b/src/libcamera/software_isp/debayer_cpu.cpp
+@@ -968,7 +968,12 @@ void DebayerCpu::updateGammaTable(const DebayerParams &params)
+ 			normalized = 0.5 * std::pow(normalized / 0.5, contrastExp);
+ 		else
+ 			normalized = 1.0 - 0.5 * std::pow((1.0 - normalized) / 0.5, contrastExp);
+-		value = UINT8_MAX * std::pow(normalized, gamma);
++		if (normalized < params.toeThreshold)
++			normalized = params.toeSlope * normalized;
++		else
++			normalized = (1.0f + params.gammaOffset) * std::pow(normalized, gamma) -
++				     params.gammaOffset;
++		value = UINT8_MAX * std::clamp(normalized, 0.0f, 1.0f);
+ 	}
+ }
+ 
+@@ -976,6 +981,9 @@ void DebayerCpu::updateLookupTables(const DebayerParams &params)
+ {
+ 	const bool gammaUpdateNeeded =
+ 		params.gamma != params_.gamma ||
++		params.gammaOffset != params_.gammaOffset ||
++		params.toeThreshold != params_.toeThreshold ||
++		params.toeSlope != params_.toeSlope ||
+ 		params.blackLevel != params_.blackLevel ||
+ 		params.contrastExp != params_.contrastExp;
+ 	if (gammaUpdateNeeded)
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 91dd95d..a079848 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -109,6 +109,9 @@ int DebayerEGL::getShaderVariableLocations(void)
+ 	ccmUniformDataIn_ = glGetUniformLocation(programId_, "ccm");
+ 	blackLevelUniformDataIn_ = glGetUniformLocation(programId_, "blacklevel");
+ 	gammaUniformDataIn_ = glGetUniformLocation(programId_, "gamma");
++	gammaOffsetUniformDataIn_ = glGetUniformLocation(programId_, "gammaOffset");
++	toeThresholdUniformDataIn_ = glGetUniformLocation(programId_, "toeThreshold");
++	toeSlopeUniformDataIn_ = glGetUniformLocation(programId_, "toeSlope");
+ 	contrastExpUniformDataIn_ = glGetUniformLocation(programId_, "contrastExp");
+ 	lscUniformTexture_ = glGetUniformLocation(programId_, "tex_lsc");
+ 	lscUniformMin_ = glGetUniformLocation(programId_, "lsc_min");
+@@ -500,7 +503,12 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	 * Gamma
+ 	 */
+ 	glUniform1f(gammaUniformDataIn_, params.gamma);
+-	LOG(Debayer, Debug) << " gammaUniformDataIn_ " << gammaUniformDataIn_ << " data " << params.gamma;
++	glUniform1f(gammaOffsetUniformDataIn_, params.gammaOffset);
++	glUniform1f(toeThresholdUniformDataIn_, params.toeThreshold);
++	glUniform1f(toeSlopeUniformDataIn_, params.toeSlope);
++	LOG(Debayer, Debug) << " gammaUniformDataIn_ " << gammaUniformDataIn_ << " data " << params.gamma
++			    << " toe offset " << params.gammaOffset << " threshold " << params.toeThreshold
++			    << " slope " << params.toeSlope;
+ 
+ 	/*
+ 	 * Contrast
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index 64df989..cf7216e 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -130,6 +130,9 @@ private:
+ 
+ 	/* Gamma */
+ 	GLint gammaUniformDataIn_;
++	GLint gammaOffsetUniformDataIn_ = -1;
++	GLint toeThresholdUniformDataIn_ = -1;
++	GLint toeSlopeUniformDataIn_ = -1;
+ 
+ 	/* Contrast */
+ 	GLint contrastExpUniformDataIn_;
+-- 
+2.43.0
+

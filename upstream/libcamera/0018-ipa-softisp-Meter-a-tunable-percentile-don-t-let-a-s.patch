@@ -1,0 +1,122 @@
+From 28587eaa33008b0ab3c1c70005b0aac01daf7299 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Thu, 27 Aug 2026 09:17:42 +0000
+Subject: [PATCH] ipa: softisp: Meter a tunable percentile, don't let a screen
+ drive the AWB
+
+The median holds a subject that fills the metered area, but a small
+face in front of a dark room is above the median, and aiming the dark
+background at the target blows the face out. Let the tuning file pick
+the percentile (meteringPercentile, default 50).
+
+The zone weighting of the AWB scaled the weight with the brightness all
+the way up, so the brightest zone, typically a screen or a lamp and
+rarely neutral, drove the balance. Saturate the brightness weight at
+40 % of the brightest zone and weigh down zones above 85 % of it.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/agc.cpp | 27 ++++++++++++++++++---------
+ src/ipa/softisp/algorithms/agc.h   |  1 +
+ src/ipa/softisp/algorithms/awb.cpp | 16 ++++++++++++++--
+ 3 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index 39b0684..a2e515b 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -138,6 +138,12 @@ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ 	highlightPercentile_ = tuningData["highlightPercentile"].get<double>(kDefaultHighlightPercentile);
+ 	meteringCentreWeight_ = tuningData["meteringCentreWeight"].get<double>(0.0);
+ 	meteringMedianTarget_ = tuningData["meteringMedianTarget"].get<double>(0.0);
++	meteringPercentile_ = tuningData["meteringPercentile"].get<double>(50.0);
++	if (meteringPercentile_ <= 0.0 || meteringPercentile_ >= 100.0) {
++		LOG(IPASoftIspExposure, Warning)
++			<< "meteringPercentile must be in ]0, 100[, using 50";
++		meteringPercentile_ = 50.0;
++	}
+ 	if (meteringMedianTarget_ < 0.0 || meteringMedianTarget_ >= 1.0) {
+ 		LOG(IPASoftIspExposure, Warning)
+ 			<< "meteringMedianTarget must be in [0, 1[, ignored";
+@@ -621,20 +627,23 @@ void Agc::process(IPAContext &context,
+ 			       0.114 / std::max(gains.b(), 1e-3);
+ 
+ 	/*
+-	 * Median metering (meteringMedianTarget): the mean sample value
+-	 * follows every bright patch, as the bins are linear. Aim the median
+-	 * of the metered pixels, the bulk of the subject, at the target
+-	 * (normalised linear, after the digital and white balance gains)
+-	 * instead, and express it as the equivalent MSV so that the update
+-	 * logic is shared: the ratio target / median is then the jump the
+-	 * update computes from the optimal MSV.
++	 * Percentile metering (meteringMedianTarget): the mean sample value
++	 * follows every bright patch, as the bins are linear. Aim the
++	 * meteringPercentile of the metered pixels at the target (normalised
++	 * linear, after the digital and white balance gains) instead. The
++	 * median is the bulk of the subject when the subject fills the
++	 * metered area; a somewhat higher percentile also covers a subject
++	 * brighter than a dark background. It is expressed as the equivalent
++	 * MSV so that the update logic is shared: the ratio target / value is
++	 * then the jump the update computes from the optimal MSV.
+ 	 */
+ 	if (meteringMedianTarget_ > 0.0 && denom > 0.0) {
++		const double fraction = meteringPercentile_ / 100.0;
+ 		double seen = 0.0;
+ 		double position = 0.0;
+ 		for (unsigned int i = 0; i < histogramSize; i++) {
+-			if (seen + histogram[i] >= 0.5) {
+-				position = i + (0.5 - seen) / std::max(histogram[i], 1e-9);
++			if (seen + histogram[i] >= fraction) {
++				position = i + (fraction - seen) / std::max(histogram[i], 1e-9);
+ 				break;
+ 			}
+ 			seen += histogram[i];
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index ae6708b..7731163 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -50,6 +50,7 @@ private:
+ 	double highlightPercentile_;
+ 	double meteringCentreWeight_;
+ 	double meteringMedianTarget_;
++	double meteringPercentile_;
+ 	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+ 
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index b1c2bab..d1bfa6b 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -89,6 +89,15 @@ private:
+  */
+ static constexpr double kZoneColourSigma = 0.35;
+ static constexpr double kZoneClipFraction = 0.9;
++/*
++ * The brightness weight saturates at this fraction of the brightest zone,
++ * so that a screen or a lamp in the frame, the brightest zone by far and
++ * rarely neutral, doesn't outweigh the walls; above kZoneSourceFraction
++ * the zone is probably a light source and is weighed down.
++ */
++static constexpr double kZoneBrightKnee = 0.4;
++static constexpr double kZoneSourceFraction = 0.85;
++static constexpr double kZoneSourceWeight = 0.3;
+ 
+ int Awb::init(IPAContext &context, const ValueNode &tuningData)
+ {
+@@ -170,8 +179,11 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 			const double rr = m[0] / m[1] * gains.r() / std::max(gains.g(), 1e-3);
+ 			const double bb = m[2] / m[1] * gains.b() / std::max(gains.g(), 1e-3);
+ 			const double colour = std::hypot(rr - 1.0, bb - 1.0) / kZoneColourSigma;
+-			const double weight = (maxY > 0.0 ? m[3] / maxY : 0.0) *
+-					      std::exp(-colour * colour);
++			const double relY = maxY > 0.0 ? m[3] / maxY : 0.0;
++			double bright = std::min(relY / kZoneBrightKnee, 1.0);
++			if (relY > kZoneSourceFraction)
++				bright *= kZoneSourceWeight;
++			const double weight = bright * std::exp(-colour * colour);
+ 			sum += RGB<double>({ m[0], m[1], m[2] }) * weight;
+ 			weightSum += weight;
+ 		}
+-- 
+2.43.0
+

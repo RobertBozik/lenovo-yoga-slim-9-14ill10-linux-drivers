@@ -1,0 +1,463 @@
+From f4d38f30c54cf7869c9d9fa224c10de26fb9751f Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Thu, 27 Aug 2026 08:59:04 +0000
+Subject: [PATCH 15/16] libcamera: software_isp: Gather zone statistics and
+ meter the centre
+
+The statistics are a single histogram and a single set of sums for the
+whole frame, so the AGC has no notion of where the light is: a window
+behind the subject wins and the subject goes black.
+
+Accumulate the sampled pixels into a 16x9 grid of zones (sums and
+counts) and gather a second luminance histogram over the central zones.
+Let the tuning file set meteringCentreWeight: the mean sample value is
+then taken from a blend of the whole frame and the centre, and the
+highlight protection looks at the centre only, so that the background
+is allowed to clip. The default of 0 keeps the whole-frame metering.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ .../internal/software_isp/swisp_stats.h       | 32 +++++++
+ .../internal/software_isp/swstats_cpu.h       | 31 ++++---
+ src/ipa/softisp/algorithms/agc.cpp            | 54 ++++++++---
+ src/ipa/softisp/algorithms/agc.h              |  1 +
+ src/libcamera/software_isp/swstats_cpu.cpp    | 89 ++++++++++++++-----
+ 5 files changed, 159 insertions(+), 48 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swisp_stats.h b/include/libcamera/internal/software_isp/swisp_stats.h
+index 3428298..1b776d0 100644
+--- a/include/libcamera/internal/software_isp/swisp_stats.h
++++ b/include/libcamera/internal/software_isp/swisp_stats.h
+@@ -51,6 +51,38 @@ struct SwIspStats {
+ 	 * \brief A histogram of luminance values of all the sampled pixels
+ 	 */
+ 	Histogram yHistogram;
++	/**
++	 * \brief Number of zones across and down the statistics window
++	 */
++	static constexpr unsigned int kZonesX = 16;
++	static constexpr unsigned int kZonesY = 9;
++	/**
++	 * \brief The central zones, kCentreX0 <= x < kCentreX1 and likewise
++	 * for y, whose luminance is also gathered in yHistogramCentre
++	 */
++	static constexpr unsigned int kCentreX0 = 4;
++	static constexpr unsigned int kCentreX1 = 12;
++	static constexpr unsigned int kCentreY0 = 2;
++	static constexpr unsigned int kCentreY1 = 7;
++	/**
++	 * \brief Per-zone sums of the sampled pixels, row by row
++	 */
++	struct Zone {
++		uint32_t sumR, sumG, sumB;
++		uint32_t count;
++	};
++	std::array<Zone, kZonesX * kZonesY> zones;
++	/**
++	 * \brief Right shift that brings the zone sums to the 8-bit scale
++	 *
++	 * The zone sums are accumulated at the bit depth of the input format,
++	 * unlike sum_ which is already shifted.
++	 */
++	unsigned int zoneShift;
++	/**
++	 * \brief A histogram of luminance values of the central zones
++	 */
++	Histogram yHistogramCentre;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 71b51f0..aa7aa9c 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <stdint.h>
+ #include <vector>
+ 
+@@ -67,7 +68,7 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
+-		(this->*stats0_)(src, stats_[statsBufferIndex]);
++		(this->*stats0_)(src, stats_[statsBufferIndex], zoneRow(y));
+ 	}
+ 
+ 	void processLine2(uint32_t frame, unsigned int y, const uint8_t *src[], unsigned int statsBufferIndex = 0)
+@@ -79,31 +80,39 @@ public:
+ 		    y >= (window_.y + window_.height))
+ 			return;
+ 
+-		(this->*stats2_)(src, stats_[statsBufferIndex]);
++		(this->*stats2_)(src, stats_[statsBufferIndex], zoneRow(y));
+ 	}
+ 
+ 	Signal<uint32_t, uint32_t> statsReady;
+ 
+ private:
+-	using statsProcessFn = void (SwStatsCpu::*)(const uint8_t *src[], SwIspStats &stats);
++	using statsProcessFn = void (SwStatsCpu::*)(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
+ 	using processFrameFn = void (SwStatsCpu::*)(MappedFrameBuffer &in);
+ 
+ 	int setupStandardBayerOrder(BayerFormat::Order order);
+ 	/* Bayer 8 bpp unpacked */
+-	void statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
+ 	/* Bayer 10 bpp unpacked */
+-	void statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
+ 	/* Bayer 12 bpp unpacked */
+-	void statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
+ 	/* Bayer 10 bpp packed */
+-	void statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats);
+-	void statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
++	void statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
+ 	/* Bayer 12 bpp packed */
+-	void statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats);
+-	void statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats);
++	void statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
++	void statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy);
+ 
+ 	void processBayerFrame2(MappedFrameBuffer &in);
+ 
++	/* Zone row of an image line, y being relative to the whole image */
++	unsigned int zoneRow(unsigned int y) const
++	{
++		const unsigned int rel = y - window_.y;
++		return std::min(rel * SwIspStats::kZonesY / window_.height,
++				SwIspStats::kZonesY - 1);
++	}
++
+ 	processFrameFn processFrame_;
+ 
+ 	/* Variables set by configure(), used every line */
+@@ -120,6 +129,8 @@ private:
+ 	unsigned int xShift_;
+ 	unsigned int stride_;
+ 	unsigned int sumShift_;
++	/* Samples per line, one per 4 pixels, for the zone column */
++	unsigned int samplesPerLine_;
+ 
+ 	std::vector<SwIspStats> stats_;
+ 	SharedMemObject<SwIspStats> sharedStats_;
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index b41c753..247933f 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -8,6 +8,7 @@
+ #include "agc.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <cmath>
+ #include <limits>
+ #include <stdint.h>
+@@ -135,6 +136,12 @@ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ 	startExposureTime_ = tuningData["startExposureTime"].get<uint32_t>();
+ 	startGain_ = tuningData["startGain"].get<double>();
+ 	highlightPercentile_ = tuningData["highlightPercentile"].get<double>(kDefaultHighlightPercentile);
++	meteringCentreWeight_ = tuningData["meteringCentreWeight"].get<double>(0.0);
++	if (meteringCentreWeight_ < 0.0 || meteringCentreWeight_ > 1.0) {
++		LOG(IPASoftIspExposure, Warning)
++			<< "meteringCentreWeight must be in [0, 1], ignored";
++		meteringCentreWeight_ = 0.0;
++	}
+ 	if (highlightLevel_ < 0.0 || highlightLevel_ > 1.0 ||
+ 	    highlightPercentile_ <= 0.0 || highlightPercentile_ > 100.0) {
+ 		LOG(IPASoftIspExposure, Warning)
+@@ -542,7 +549,6 @@ void Agc::process(IPAContext &context,
+ 	 * Calculate Mean Sample Value (MSV) according to formula from:
+ 	 * https://www.araa.asn.au/acra/acra2007/papers/paper84final.pdf
+ 	 */
+-	const auto &histogram = stats->yHistogram;
+ 	const unsigned int blackLevelHistIdx =
+ 		context.activeState.blc.level * SwIspStats::kYHistogramBinsPerLevel;
+ 	const unsigned int histogramSize =
+@@ -550,9 +556,31 @@ void Agc::process(IPAContext &context,
+ 	const unsigned int yHistValsPerBin = histogramSize / kExposureBinsCount;
+ 	const unsigned int yHistValsPerBinMod =
+ 		histogramSize / (histogramSize % kExposureBinsCount + 1);
+-	int exposureBins[kExposureBinsCount] = {};
+-	unsigned int denom = 0;
+-	unsigned int num = 0;
++	double exposureBins[kExposureBinsCount] = {};
++	double denom = 0;
++	double num = 0;
++
++	/*
++	 * Metering: with meteringCentreWeight the mean is taken from a blend
++	 * of the whole frame and the central zones, each normalised to its
++	 * pixel count, so that a bright window behind the subject doesn't
++	 * darken the subject. The highlight protection then looks at the
++	 * subject only, the background is allowed to clip.
++	 */
++	const auto &full = stats->yHistogram;
++	const auto &centre = stats->yHistogramCentre;
++	double totalFull = 0.0, totalCentre = 0.0;
++	for (unsigned int i = 0; i < histogramSize; i++) {
++		totalFull += full[blackLevelHistIdx + i];
++		totalCentre += centre[blackLevelHistIdx + i];
++	}
++	const double w = totalCentre > 0.0 ? meteringCentreWeight_ : 0.0;
++	std::array<double, SwIspStats::kYHistogramSize> histogram;
++	for (unsigned int i = 0; i < histogramSize; i++) {
++		const unsigned int k = blackLevelHistIdx + i;
++		histogram[i] = (totalFull > 0.0 ? (1.0 - w) * full[k] / totalFull : 0.0) +
++			       (w > 0.0 ? w * centre[k] / totalCentre : 0.0);
++	}
+ 
+ 	if (yHistValsPerBin == 0) {
+ 		LOG(IPASoftIspExposure, Debug)
+@@ -570,7 +598,7 @@ void Agc::process(IPAContext &context,
+ 		unsigned int scaled = std::min<unsigned int>(
+ 			static_cast<unsigned int>(i * digitalGain), histogramSize - 1);
+ 		unsigned int idx = (scaled - (scaled / yHistValsPerBinMod)) / yHistValsPerBin;
+-		exposureBins[idx] += histogram[blackLevelHistIdx + i];
++		exposureBins[idx] += histogram[i];
+ 	}
+ 
+ 	for (unsigned int i = 0; i < kExposureBinsCount; i++) {
+@@ -579,7 +607,7 @@ void Agc::process(IPAContext &context,
+ 		num += exposureBins[i] * (i + 1);
+ 	}
+ 
+-	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
++	float exposureMSV = (denom <= 0.0 ? 0 : static_cast<float>(num / denom));
+ 
+ 	/*
+ 	 * Luminance of the highlightPercentile of the pixels as the ISP
+@@ -590,23 +618,21 @@ void Agc::process(IPAContext &context,
+ 	 */
+ 	double highlight = 0.0;
+ 	if (highlightLevel_ > 0.0) {
+-		unsigned int total = 0;
+-		for (unsigned int i = 0; i < histogramSize; i++)
+-			total += histogram[blackLevelHistIdx + i];
++		const auto &hl = w > 0.0 ? centre : full;
++		const double total = w > 0.0 ? totalCentre : totalFull;
+ 
+-		const unsigned int above = static_cast<unsigned int>(
+-			total * (100.0 - highlightPercentile_) / 100.0);
++		const double above = total * (100.0 - highlightPercentile_) / 100.0;
+ 		/*
+ 		 * The bins are coarse compared to the signal of a dark scene,
+ 		 * so locate the percentile inside its bin assuming the pixels
+ 		 * are spread evenly over the bin.
+ 		 */
+-		unsigned int seen = 0;
++		double seen = 0;
+ 		double position = histogramSize;
+ 		for (unsigned int i = histogramSize; i > 0; i--) {
+-			const unsigned int count = histogram[blackLevelHistIdx + i - 1];
++			const double count = hl[blackLevelHistIdx + i - 1];
+ 			if (seen + count > above) {
+-				position = i - static_cast<double>(above - seen) / std::max(count, 1u);
++				position = i - (above - seen) / std::max(count, 1.0);
+ 				break;
+ 			}
+ 			seen += count;
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 5aba635..724db7d 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -48,6 +48,7 @@ private:
+ 	std::optional<uint32_t> startExposureTime_;
+ 	std::optional<double> startGain_;
+ 	double highlightPercentile_;
++	double meteringCentreWeight_;
+ 	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+ 
+diff --git a/src/libcamera/software_isp/swstats_cpu.cpp b/src/libcamera/software_isp/swstats_cpu.cpp
+index 7fb77ce..b0082c5 100644
+--- a/src/libcamera/software_isp/swstats_cpu.cpp
++++ b/src/libcamera/software_isp/swstats_cpu.cpp
+@@ -171,30 +171,55 @@ static constexpr unsigned int kRedYMul = 77; /* 0.299 * 256 */
+ static constexpr unsigned int kGreenYMul = 150; /* 0.587 * 256 */
+ static constexpr unsigned int kBlueYMul = 29; /* 0.114 * 256 */
+ 
+-#define SWSTATS_START_LINE_STATS(pixel_t) \
+-	pixel_t r, g, g2, b;              \
+-	uint64_t yVal;                    \
+-                                          \
+-	uint64_t sumR = 0;                \
+-	uint64_t sumG = 0;                \
++#define SWSTATS_START_LINE_STATS(pixel_t)                                   \
++	pixel_t r, g, g2, b;                                                \
++	uint64_t yVal;                                                      \
++	unsigned int yBin;                                                  \
++	unsigned int sample = 0;                                            \
++	SwIspStats::Zone *zoneRow = &stats.zones[zy * SwIspStats::kZonesX]; \
++	const bool centreRow = zy >= SwIspStats::kCentreY0 &&               \
++			       zy < SwIspStats::kCentreY1;                  \
++                                                                            \
++	uint64_t sumR = 0;                                                  \
++	uint64_t sumG = 0;                                                  \
+ 	uint64_t sumB = 0;
+ 
+-#define SWSTATS_ACCUMULATE_LINE_STATS(div) \
+-	sumR += r;                         \
+-	sumG += g;                         \
+-	sumB += b;                         \
+-                                           \
+-	yVal = r * kRedYMul;               \
+-	yVal += g * kGreenYMul;            \
+-	yVal += b * kBlueYMul;             \
+-	stats.yHistogram[yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div))]++;
++/*
++ * Besides the frame totals, accumulate the sample into its zone (one per
++ * 4 pixels, samplesPerLine_ per line) and, for the central zones, into
++ * the second luminance histogram.
++ */
++#define SWSTATS_ACCUMULATE_LINE_STATS(div)                                      \
++	sumR += r;                                                              \
++	sumG += g;                                                              \
++	sumB += b;                                                              \
++                                                                                \
++	yVal = r * kRedYMul;                                                    \
++	yVal += g * kGreenYMul;                                                 \
++	yVal += b * kBlueYMul;                                                  \
++	yBin = yVal * SwIspStats::kYHistogramSize / (256 * 256 * (div));        \
++	stats.yHistogram[yBin]++;                                               \
++	{                                                                       \
++		const unsigned int zx = std::min(sample * SwIspStats::kZonesX / \
++							 samplesPerLine_,       \
++						 SwIspStats::kZonesX - 1);      \
++		SwIspStats::Zone &zone = zoneRow[zx];                           \
++		zone.sumR += r;                                                 \
++		zone.sumG += g;                                                 \
++		zone.sumB += b;                                                 \
++		zone.count++;                                                   \
++		if (centreRow && zx >= SwIspStats::kCentreX0 &&                 \
++		    zx < SwIspStats::kCentreX1)                                 \
++			stats.yHistogramCentre[yBin]++;                         \
++		sample++;                                                       \
++	}
+ 
+ #define SWSTATS_FINISH_LINE_STATS() \
+ 	stats.sum_.r() += sumR;     \
+ 	stats.sum_.g() += sumG;     \
+ 	stats.sum_.b() += sumB;
+ 
+-void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x;
+ 	const uint8_t *src1 = src[2] + window_.x;
+@@ -219,7 +244,7 @@ void SwStatsCpu::statsBGGR8Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+@@ -245,7 +270,7 @@ void SwStatsCpu::statsBGGR10Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint16_t *src0 = (const uint16_t *)src[1] + window_.x;
+ 	const uint16_t *src1 = (const uint16_t *)src[2] + window_.x;
+@@ -271,7 +296,7 @@ void SwStatsCpu::statsBGGR12Line0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 5 / 4;
+ 	const uint8_t *src1 = src[2] + window_.x * 5 / 4;
+@@ -297,7 +322,7 @@ void SwStatsCpu::statsBGGR10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 5 / 4;
+ 	const uint8_t *src1 = src[2] + window_.x * 5 / 4;
+@@ -323,7 +348,7 @@ void SwStatsCpu::statsGBRG10PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 3 / 2;
+ 	const uint8_t *src1 = src[2] + window_.x * 3 / 2;
+@@ -349,7 +374,7 @@ void SwStatsCpu::statsBGGR12PLine0(const uint8_t *src[], SwIspStats &stats)
+ 	SWSTATS_FINISH_LINE_STATS()
+ }
+ 
+-void SwStatsCpu::statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats)
++void SwStatsCpu::statsGBRG12PLine0(const uint8_t *src[], SwIspStats &stats, unsigned int zy)
+ {
+ 	const uint8_t *src0 = src[1] + window_.x * 3 / 2;
+ 	const uint8_t *src1 = src[2] + window_.x * 3 / 2;
+@@ -392,6 +417,8 @@ void SwStatsCpu::startFrame(uint32_t frame)
+ 	for (auto &s : stats_) {
+ 		s.sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		s.yHistogram.fill(0);
++		s.yHistogramCentre.fill(0);
++		s.zones.fill(SwIspStats::Zone{ 0, 0, 0, 0 });
+ 	}
+ }
+ 
+@@ -409,13 +436,24 @@ void SwStatsCpu::finishFrame(uint32_t frame, uint32_t bufferId)
+ 	if (valid) {
+ 		sharedStats_->sum_ = RGB<uint64_t>({ 0, 0, 0 });
+ 		sharedStats_->yHistogram.fill(0);
++		sharedStats_->yHistogramCentre.fill(0);
++		sharedStats_->zones.fill(SwIspStats::Zone{ 0, 0, 0, 0 });
+ 		for (const auto &s : stats_) {
+ 			sharedStats_->sum_ += s.sum_;
+-			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++)
++			for (unsigned int j = 0; j < SwIspStats::kYHistogramSize; j++) {
+ 				sharedStats_->yHistogram[j] += s.yHistogram[j];
++				sharedStats_->yHistogramCentre[j] += s.yHistogramCentre[j];
++			}
++			for (unsigned int j = 0; j < sharedStats_->zones.size(); j++) {
++				sharedStats_->zones[j].sumR += s.zones[j].sumR;
++				sharedStats_->zones[j].sumG += s.zones[j].sumG;
++				sharedStats_->zones[j].sumB += s.zones[j].sumB;
++				sharedStats_->zones[j].count += s.zones[j].count;
++			}
+ 		}
+ 
+ 		sharedStats_->sum_ >>= sumShift_;
++		sharedStats_->zoneShift = sumShift_;
+ 	}
+ 
+ 	sharedStats_->valid = valid;
+@@ -570,6 +608,9 @@ void SwStatsCpu::setWindow(const Rectangle &window)
+ 	window_.width = (window_.width > xShift_ ? window_.width - xShift_ : 0);
+ 	window_.width &= ~(patternSize_.width - 1);
+ 	window_.height &= ~(patternSize_.height - 1);
++
++	/* One sample per 4 pixels, see the line functions */
++	samplesPerLine_ = std::max(window_.width / 4, 1u);
+ }
+ 
+ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+@@ -589,7 +630,7 @@ void SwStatsCpu::processBayerFrame2(MappedFrameBuffer &in)
+ 		/* linePointers[0] is not used by any stats0_ functions */
+ 		linePointers[1] = src;
+ 		linePointers[2] = src + stride_;
+-		(this->*stats0_)(linePointers, stats_[0]);
++		(this->*stats0_)(linePointers, stats_[0], zoneRow(window_.y + y));
+ 		src += stride_ * 2;
+ 	}
+ }
+-- 
+2.43.0
+

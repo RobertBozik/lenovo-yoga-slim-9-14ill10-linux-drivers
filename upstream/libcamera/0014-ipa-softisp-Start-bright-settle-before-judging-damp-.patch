@@ -1,0 +1,250 @@
+From cc7e34c4c2dd2479e46c779569dfba1852ad3553 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Thu, 27 Aug 2026 08:48:12 +0000
+Subject: [PATCH] ipa: softisp: Start bright, settle before judging, damp the
+ highlight guard
+
+Three things the AGC does badly on a slow, dim sensor:
+
+The stream starts with the driver defaults, a short exposure at unity
+gain, and an indoor scene stays black for a couple of seconds while the
+gain climbs up in steps of two every four frames. Let the tuning file
+provide startExposureTime (microseconds, lengthening the frame within
+the limits) and startGain; the IPA applies them when it starts. Also
+allow a jump of four when far from the target, and compute statistics
+every other frame instead of every fourth.
+
+A sensor change takes a few frames to land, and statistics of frames
+captured in between are judged as if the change had already happened.
+Skip them until the frame carries the commanded settings, at most two
+periods in case the driver clamped the request.
+
+The highlight guard flipped between pulling the gain down and letting
+the mean push it up when the highlight sat right at the level, which
+with a bright sky behind the subject turned into a visible limit cycle.
+Add hysteresis: pull down only above 1.1x the level, hold within the
+band, and aim increases at 0.95x the level.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ .../internal/software_isp/swstats_cpu.h       |  2 +-
+ src/ipa/softisp/algorithms/agc.cpp            | 99 ++++++++++++++++++-
+ src/ipa/softisp/algorithms/agc.h              |  2 +
+ src/ipa/softisp/ipa_context.h                 |  4 +
+ src/ipa/softisp/softisp.cpp                   | 12 +++
+ 5 files changed, 114 insertions(+), 5 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/swstats_cpu.h b/include/libcamera/internal/software_isp/swstats_cpu.h
+index 5518709..71b51f0 100644
+--- a/include/libcamera/internal/software_isp/swstats_cpu.h
++++ b/include/libcamera/internal/software_isp/swstats_cpu.h
+@@ -44,7 +44,7 @@ public:
+ 	 * Run stats once every 4 frames to ensure any previous
+ 	 * exposure changes have been applied.
+ 	 */
+-	static constexpr uint32_t kStatPerNumFrames = 4;
++	static constexpr uint32_t kStatPerNumFrames = 2;
+ 
+ 	bool isValid() const { return sharedStats_.fd().isValid(); }
+ 
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index 632d8b5..b41c753 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -76,7 +76,26 @@ static constexpr float kExpMaxStep = 0.15;
+  * correction takes over near the target, so the convergence stays smooth.
+  */
+ static constexpr float kExpLargeError = 0.5;
+-static constexpr float kExpMaxJump = 2.0;
++static constexpr float kExpMaxJump = 4.0;
++
++/*
++ * A sensor change takes a few frames to land. Statistics of frames still
++ * captured with the previous settings would repeat the decision (the
++ * decision is relative to the settings of the frame, so it doesn't
++ * compound), but would also be wrong once the change has landed halfway.
++ * Skip the statistics until the frame carries the commanded settings, at
++ * most this many periods in case the driver clamped the request.
++ */
++static constexpr unsigned int kMaxSettlePeriods = 2;
++
++/*
++ * Hysteresis of the highlight protection: the gain is pulled down only
++ * when the highlight exceeds the level by this factor, and an increase
++ * aims a bit below the level, so that noise in the estimate doesn't turn
++ * into a limit cycle.
++ */
++static constexpr double kHighlightHysteresis = 1.1;
++static constexpr double kHighlightAim = 0.95;
+ 
+ /*
+  * Digital gain is applied by the ISP on top of the sensor exposure and
+@@ -113,6 +132,8 @@ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
+ 	maxDigitalGain_ = tuningData["maxDigitalGain"].get<double>(kDefaultMaxDigitalGain);
+ 	highlightLevel_ = tuningData["highlightLevel"].get<double>(kDefaultHighlightLevel);
++	startExposureTime_ = tuningData["startExposureTime"].get<uint32_t>();
++	startGain_ = tuningData["startGain"].get<double>();
+ 	highlightPercentile_ = tuningData["highlightPercentile"].get<double>(kDefaultHighlightPercentile);
+ 	if (highlightLevel_ < 0.0 || highlightLevel_ > 1.0 ||
+ 	    highlightPercentile_ <= 0.0 || highlightPercentile_ > 100.0) {
+@@ -187,8 +208,46 @@ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &co
+ 	}
+ 	agc.vblank = cfg.vblankDef;
+ 	agc.dgain = 1.0;
++	agc.settling = 0;
+ 	context.configuration.agc.dgainMax = maxDigitalGain_;
+ 
++	/*
++	 * Without startup settings the sensor streams with the driver
++	 * defaults, usually a short exposure at unity gain, and the first
++	 * frames of an indoor scene are black until the AGC has climbed all
++	 * the way up. The tuning file can provide the exposure time (in
++	 * microseconds, lengthening the frame within the limits) and the
++	 * analogue gain to start from; the IPA applies them when it starts.
++	 */
++	context.configuration.agc.startControls = false;
++	if (startExposureTime_ || startGain_) {
++		IPAFrameContext startFrame{};
++		startFrame.agc.minFrameDuration = agc.minFrameDuration;
++		startFrame.agc.maxFrameDuration = agc.maxFrameDuration;
++		int32_t vblankLo, vblankHi;
++		vblankRange(context, startFrame, vblankLo, vblankHi);
++
++		if (startExposureTime_) {
++			const double lines = std::round(
++				std::chrono::microseconds(*startExposureTime_) / cfg.lineDuration);
++			agc.exposure = std::clamp(static_cast<int32_t>(lines), cfg.exposureMin,
++						  exposureMaxForVblank(context, vblankHi));
++		} else {
++			agc.exposure = exposureMaxForVblank(context, cfg.vblankDef);
++		}
++		agc.vblank = std::clamp(agc.exposure + cfg.exposureMargin -
++						static_cast<int32_t>(cfg.frameHeight),
++					vblankLo, vblankHi);
++		agc.again = std::clamp(startGain_.value_or(cfg.again10),
++				       cfg.againMin, cfg.againMax);
++		agc.valid = true;
++		context.configuration.agc.startControls = true;
++
++		LOG(IPASoftIspExposure, Info)
++			<< "Startup exposure " << agc.exposure << " lines, gain "
++			<< agc.again << ", vblank " << agc.vblank;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -307,9 +366,19 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext,
+ 	 */
+ 	double factorMax = std::numeric_limits<double>::infinity();
+ 	if (highlightLevel_ > 0.0 && highlight > 0.0) {
+-		factorMax = highlightLevel_ / highlight;
+-		if (factorMax < 1.0 && error > -kExposureSatisfactory)
+-			error = std::min(error, -2.0 * kExposureSatisfactory);
++		if (highlight > highlightLevel_ * kHighlightHysteresis) {
++			/* Clipped: pull down to the level. */
++			factorMax = highlightLevel_ / highlight;
++			if (error > -kExposureSatisfactory)
++				error = std::min(error, -2.0 * kExposureSatisfactory);
++		} else if (highlight >= highlightLevel_) {
++			/* Within the band: no increase, no forced decrease. */
++			factorMax = 1.0;
++		} else {
++			factorMax = kHighlightAim * highlightLevel_ / highlight;
++			if (factorMax < 1.0)
++				factorMax = 1.0;
++		}
+ 	}
+ 
+ 	if (std::abs(error) <= kExposureSatisfactory || (error > 0.0 && factorMax <= 1.0)) {
+@@ -447,6 +516,28 @@ void Agc::process(IPAContext &context,
+ 		return;
+ 	}
+ 
++	/*
++	 * Wait for the last commanded sensor settings to land before judging
++	 * the result, unless the driver seems to have clamped them.
++	 */
++	auto &active = context.activeState.agc;
++	const bool landed = frameContext.sensor.exposure == active.exposure &&
++			    std::abs(frameContext.sensor.gain - active.again) <
++				    context.configuration.agc.againMinStep / 2.0;
++	if (!landed && active.settling < kMaxSettlePeriods) {
++		active.settling++;
++		LOG(IPASoftIspExposure, Debug)
++			<< "Settling: frame exp " << frameContext.sensor.exposure
++			<< " gain " << frameContext.sensor.gain << ", commanded exp "
++			<< active.exposure << " gain " << active.again;
++		frameContext.sensor.exposure = active.exposure;
++		frameContext.sensor.gain = active.again;
++		frameContext.sensor.vblank = active.vblank;
++		frameContext.agc.digitalGain = active.dgain;
++		return;
++	}
++	active.settling = 0;
++
+ 	/*
+ 	 * Calculate Mean Sample Value (MSV) according to formula from:
+ 	 * https://www.araa.asn.au/acra/acra2007/papers/paper84final.pdf
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 7e600f8..5aba635 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -45,6 +45,8 @@ private:
+ 
+ 	double maxDigitalGain_;
+ 	double highlightLevel_;
++	std::optional<uint32_t> startExposureTime_;
++	std::optional<double> startGain_;
+ 	double highlightPercentile_;
+ 	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+diff --git a/src/ipa/softisp/ipa_context.h b/src/ipa/softisp/ipa_context.h
+index 12a7a82..0bacaaf 100644
+--- a/src/ipa/softisp/ipa_context.h
++++ b/src/ipa/softisp/ipa_context.h
+@@ -44,6 +44,8 @@ struct IPASessionConfiguration {
+ 		uint32_t frameHeight;
+ 		/* Digital gain applied by the ISP after the sensor gain is exhausted */
+ 		double dgainMax;
++		/* The active state holds startup sensor settings to apply */
++		bool startControls;
+ 	} agc;
+ 	struct {
+ 		std::optional<uint8_t> level;
+@@ -60,6 +62,8 @@ struct IPAActiveState {
+ 		int32_t vblank;
+ 		double dgain;
+ 		bool valid;
++		/* Statistics periods skipped while a sensor change lands */
++		unsigned int settling;
+ 		utils::Duration minFrameDuration;
+ 		utils::Duration maxFrameDuration;
+ 	} agc;
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 94a33ef..06454c5 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -314,6 +314,18 @@ int IPASoftIsp::start(const ControlList &controls)
+ 	for (const auto &algo : algorithms())
+ 		algo->queueRequest(context_, 0, frameContext, controls);
+ 
++	/* Startup sensor settings from the tuning file, see Agc::configure() */
++	if (context_.configuration.agc.startControls) {
++		const auto &agc = context_.activeState.agc;
++		ControlList ctrls(sensorInfoMap_);
++		ctrls.set(V4L2_CID_EXPOSURE, agc.exposure);
++		ctrls.set(V4L2_CID_ANALOGUE_GAIN,
++			  static_cast<int32_t>(camHelper_ ? camHelper_->gainCode(agc.again) : agc.again));
++		if (context_.configuration.agc.vblankSupported)
++			ctrls.set(V4L2_CID_VBLANK, agc.vblank);
++		setSensorControls.emit(ctrls);
++	}
++
+ 	return 0;
+ }
+ 
+-- 
+2.43.0
+

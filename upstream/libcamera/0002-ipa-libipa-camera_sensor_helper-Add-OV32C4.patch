@@ -1,0 +1,54 @@
+From 6eda16c41ff71423127651d84b4a775bbbe8eda9 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Mon, 24 Aug 2026 13:33:09 +0000
+Subject: [PATCH 2/7] ipa: libipa: camera_sensor_helper: Add OV32C4
+
+Both numbers were measured on the sensor rather than taken from the
+OmniVision helpers already present, because the obvious donor is wrong
+for this part.
+
+The analogue gain is linear in the register value, but unity is at
+0x100, not at 0x80 as on ov13b10 and ov08x40 which use the same
+register: below 0x100 the output stops tracking the value written at
+all, and the chip itself powers up at 0x100. Using code/128 here would
+make the AE loop believe it has twice the gain it actually applied.
+
+The black level is 0x40 at 10 bits, measured with the sensor covered
+across the whole gain range, where it stays within one LSB.
+
+Signed-off-by: Robert Bozik <robertbozik@gmail.com>
+---
+ src/ipa/libipa/camera_sensor_helper.cpp | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 82bf255d..6b746727 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -763,6 +763,23 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov2740", CameraSensorHelperOv2740)
+ 
++class CameraSensorHelperOv32c4 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv32c4()
++	{
++		/*
++		 * Measured on the sensor: the black level is 0x40 at 10 bits,
++		 * and the gain is linear in the register value with unity at
++		 * 0x100, not at 0x80 as on other OmniVision sensors sharing
++		 * the same gain register.
++		 */
++		blackLevel_ = 4096;
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 256 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov32c4", CameraSensorHelperOv32c4)
++
+ class CameraSensorHelperOv4689 : public CameraSensorHelper
+ {
+ public:
+-- 
+2.53.0
+

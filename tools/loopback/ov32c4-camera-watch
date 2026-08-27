@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""ov32c4-camera-watch — trvalý writer ("holder") pre v4l2loopback uzol.
+
+Prečo takto (notes/06 kap. 44, merania 2026-08-25):
+- Chromium v4l2 enumerácia vyradí zariadenie, ktoré hlási VIDEO_OUTPUT,
+  a vyžaduje neprázdny ENUM_FMT -> loopback musí bežať s exclusive_caps=1
+  A capture strana musí byť živá.
+- v4l2loopback 0.15: capture ioctl (ENUM_FMT, G_PARM, S_FMT) prejdú len
+  vtedy, keď writer práve streamuje (check_buffer_capability sa na
+  keep_format nepozerá — querycap áno; nekonzistencia). Writer "na
+  požiadanie" preto nestačí: bez neho aplikácie uzol nevyhodnotia ako
+  použiteľnú kameru (gst: not-negotiated; Chromium: HasUsableFormats).
+
+Riešenie: tento proces drží uzol otvorený NASTÁLO a vždy doň píše:
+- v pokoji čiernu snímku 2x za sekundu (senzor vypnutý, ~nulová cena),
+- keď uzol otvorí čitateľ (inotify IN_OPEN + kontrola /proc), spustí
+  gst feeder `libcamerasrc -> YUY2 1280x720@15 -> fdsink` a jeho snímky
+  prepisuje do uzla; po odchode posledného čitateľa (GRACE_STOP, 12 s) feeder
+  zastaví a vráti sa k čiernej.
+
+write() vo v4l2loopback = jedna snímka; formát je zafixovaný udev
+pravidlom (set-caps YUYV:1280x720@15, keep_format=1), my píšeme presne
+FRAME_SIZE bajtov.
+
+Obmedzenie: čitateľov počítame cez /proc/*/fd, čiže vidíme len procesy
+toho istého používateľa (bežné aplikácie); root proces feeder nespustí.
+
+Dvaja súčasní libcamera klienti dnes padajú (Chromium <=151 SIGFPE,
+wireplumber 0.5 find-best-target.lua), preto je feeder jediným vlastníkom
+kamery počas behu a loopback je v PipeWire skrytý pravidlom wireplumbera.
+
+Bez závislostí mimo python3 stdlib. Logy na stdout (žurnál služby).
+"""
+import ctypes
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+DEV = os.environ.get("OV32C4_LOOPBACK_DEV", "/dev/video42")
+WIDTH = int(os.environ.get("OV32C4_WIDTH", "1280"))
+HEIGHT = int(os.environ.get("OV32C4_HEIGHT", "720"))
+FPS = int(os.environ.get("OV32C4_FPS", "15"))
+# Zdroj v plnom rozlíšení a zmenšenie Lanczosom na CPU: GPU debayer libcamery
+# pri priamom výstupe 1280x720 vzorkuje raw textúru bez priemerovania a
+# prepúšťa šum (kap. 50: σ Y/Cb 3,59/15,0 vs 2,70/11,1 pri rovnakej scéne,
+# detail rovnaký). Cena ~33 % jedného jadra pri 15 fps. OV32C4_SRC_WIDTH/HEIGHT
+# = najväčší výstup, ktorý libcamerasrc pre senzor ponúka (3200x1800 pre
+# 3264x1840). OV32C4_SCALER=gpu vráti pôvodné priame 720p.
+SRC_WIDTH = int(os.environ.get("OV32C4_SRC_WIDTH", "3200"))
+SRC_HEIGHT = int(os.environ.get("OV32C4_SRC_HEIGHT", "1800"))
+SCALER = os.environ.get("OV32C4_SCALER", "cpu")
+if SCALER == "gpu":
+    _SRC = f"libcamerasrc ! video/x-raw,width={WIDTH},height={HEIGHT},framerate={FPS}/1"
+else:
+    _SRC = (f"libcamerasrc ! video/x-raw,width={SRC_WIDTH},height={SRC_HEIGHT},framerate={FPS}/1 ! "
+            f"videoscale method=lanczos ! video/x-raw,width={WIDTH},height={HEIGHT}")
+FEEDER = os.environ.get("OV32C4_FEEDER_CMD") or (
+    f"exec gst-launch-1.0 -q {_SRC} ! "
+    "videoconvert ! video/x-raw,format=YUY2 ! fdsink fd=1")
+
+FRAME_SIZE = WIDTH * HEIGHT * 2                 # YUYV
+BLACK = bytes((0x10, 0x80)) * (WIDTH * HEIGHT)  # Y=16, U=V=128
+IDLE_PERIOD = 0.5    # s medzi čiernymi snímkami v pokoji
+GRACE_START = 0.3    # s — enumeračné open/close feeder nespúšťa
+GRACE_STOP = 12.0    # s bez čitateľov -> feeder stop (hovor: Chromium pri zmene rozlíšenia zavrie a znovu otvorí; 4 s nestačili — kap. 44.6)
+CHECK_PERIOD = 1.0   # s — perióda kontroly čitateľov počas behu feedera
+RETRY_COOLDOWN = 3.0  # s po páde feedera, kým skúsime znova
+FEED_TIMEOUT = 4.0   # s bez snímky z feedera -> feeder je zaseknutý, zabiť (kap. 52.8: watcher visel hodinu v blokujúcom read)
+
+# Stav pre masku nad šošovkou (scripts/udc-mask.py): maska sa má ukázať
+# hneď, keď uzol niekto otvorí (skôr než senzor začne snímať), a zmiznúť
+# hneď po odchode posledného čitateľa (feeder v GRACE_STOP ešte beží,
+# ale nikto sa nepozerá) — kap. 56.
+STATE_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+                          "ov32c4-camera-state")
+
+IN_OPEN, IN_CLOSE_WRITE, IN_CLOSE_NOWRITE = 0x20, 0x08, 0x10
+IN_NONBLOCK = 0x800
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def write_state(feeder_running, readers_n):
+    """Atomicky zapíš „feeder=0/1 readers=N“ pre udc-mask."""
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(f"feeder={1 if feeder_running else 0} readers={readers_n}\n")
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log(f"stav pre masku sa nedá zapísať ({STATE_FILE}): {e}")
+
+
+def descendants(pid):
+    """pid + potomkovia (z /proc; len procesy vlastného používateľa)."""
+    pids = {pid}
+    try:
+        entries = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return pids
+    grew = True
+    while grew:
+        grew = False
+        for p in entries:
+            ip = int(p)
+            if ip in pids:
+                continue
+            try:
+                with open(f"/proc/{p}/stat", "rb") as f:
+                    st = f.read().rsplit(b")", 1)[1].split()
+                if int(st[1]) in pids:
+                    pids.add(ip)
+                    grew = True
+            except (OSError, IndexError, ValueError):
+                pass
+    return pids
+
+
+def readers(dev, exclude):
+    """Počet procesov mimo `exclude`, ktoré majú dev otvorený."""
+    n = 0
+    dev_real = os.path.realpath(dev)
+    for p in os.listdir("/proc"):
+        if not p.isdigit() or int(p) in exclude:
+            continue
+        fd_dir = f"/proc/{p}/fd"
+        try:
+            for fd in os.listdir(fd_dir):
+                try:
+                    if os.readlink(f"{fd_dir}/{fd}") == dev_real:
+                        n += 1
+                        break
+                except OSError:
+                    pass
+        except OSError:
+            continue
+    return n
+
+
+def drain(ino, label=""):
+    """Vyber čakajúce inotify udalosti; vráť (n_open, n_close) a zaloguj ich."""
+    n_open = n_close = 0
+    while True:
+        try:
+            buf = os.read(ino, 4096)
+        except BlockingIOError:
+            if label and (n_open or n_close):
+                log(f"[{label}] udalosti: open {n_open}, close {n_close}")
+            return n_open, n_close
+        off = 0
+        while off + 16 <= len(buf):
+            _, mask, _, ln = struct.unpack_from("iIII", buf, off)
+            off += 16 + ln
+            if mask & IN_OPEN:
+                n_open += 1
+            if mask & (IN_CLOSE_WRITE | IN_CLOSE_NOWRITE):
+                n_close += 1
+
+
+def stop_proc(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGINT)
+        proc.wait(timeout=3)
+    except (subprocess.TimeoutExpired, ProcessLookupError, PermissionError):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def read_frame(stream):
+    """Presne FRAME_SIZE bajtov z rúry feedera; None pri EOF alebo keď
+    feeder FEED_TIMEOUT s nič nepošle (zaseknutý gst — read() by inak
+    blokoval navždy a celý watcher s ním, kap. 52.8)."""
+    chunks = []
+    need = FRAME_SIZE
+    fd = stream.fileno()
+    while need:
+        r, _, _ = select.select([fd], [], [], FEED_TIMEOUT)
+        if not r:
+            log(f"feeder {FEED_TIMEOUT:.0f} s bez dát — považujem ho za zaseknutý")
+            return None
+        c = os.read(fd, need)
+        if not c:
+            return None
+        chunks.append(c)
+        need -= len(c)
+    return b"".join(chunks)
+
+
+def main():
+    deadline = time.monotonic() + 15
+    while not os.path.exists(DEV):
+        if time.monotonic() > deadline:
+            sys.exit(f"{DEV} neexistuje — je načítaný modul v4l2loopback?")
+        time.sleep(0.5)
+
+    dev_fd = os.open(DEV, os.O_RDWR)   # držíme nastálo: writer stream žije
+    self_pids = {os.getpid()}
+
+    ino = libc.inotify_init1(IN_NONBLOCK)
+    if ino < 0:
+        sys.exit(f"inotify_init1: {os.strerror(ctypes.get_errno())}")
+    if libc.inotify_add_watch(
+            ino, DEV.encode(),
+            IN_OPEN | IN_CLOSE_WRITE | IN_CLOSE_NOWRITE) < 0:
+        sys.exit(f"inotify_add_watch {DEV}: {os.strerror(ctypes.get_errno())}")
+
+    feeder = None
+    retry_after = 0.0
+
+    def cleanup(signum, frame):
+        if feeder is not None:
+            stop_proc(feeder)
+        write_state(False, 0)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup)
+    signal.signal(signal.SIGINT, cleanup)
+
+    log(f"držím {DEV} (čierna {WIDTH}x{HEIGHT}@2/s v pokoji); feeder: {FEEDER}")
+    os.write(dev_fd, BLACK)
+    write_state(False, 0)
+
+    while True:
+        # --- POKOJ: čierne snímky, čakáme na otvorenie uzla -------------
+        r, _, _ = select.select([ino], [], [], IDLE_PERIOD)
+        opened = drain(ino, "pokoj")[0] > 0 if r else False
+        os.write(dev_fd, BLACK)
+        if not opened or time.monotonic() < retry_after:
+            continue
+        # Maska hneď pri otvorení, ešte pred GRACE_START a štartom feedera:
+        # senzor začne snímať až o ~0,7 s, dovtedy má byť panel nad ním
+        # zhasnutý. Enumeračné otvorenie (Chromium pri štarte prejde
+        # kamery) uzol zavrie za pár ms — kým sa sem dostaneme, čitateľ
+        # tam už nie je a maska nebliká; skutočný klient ho drží.
+        early = readers(DEV, self_pids) > 0
+        if early:
+            write_state(False, 1)
+        time.sleep(GRACE_START)
+        if readers(DEV, self_pids) == 0:
+            if early:
+                write_state(False, 0)
+            continue   # len enumeračné otvorenie
+
+        # --- BEH: libcamera feeder, prepisujeme snímky ------------------
+        log("čitateľ na uzle → štartujem feeder (libcamera)")
+        write_state(True, 1)
+        feeder = subprocess.Popen(
+            FEEDER, shell=True, start_new_session=True,
+            stdout=subprocess.PIPE)
+        exclude = self_pids | descendants(feeder.pid)
+        idle_since = None
+        last_check = 0.0
+        frames = 0
+        last_readers = -1
+        last_frame_t = time.monotonic()
+        while True:
+            frame = read_frame(feeder.stdout)
+            now_t = time.monotonic()
+            gap = now_t - last_frame_t
+            if frame is not None and gap > 0.150 and frames > 0:
+                log(f"MEDZERA {gap*1000:.0f} ms pred snímkou {frames + 1}")
+            last_frame_t = now_t
+            if frame is None:
+                code = feeder.poll()
+                log(f"feeder skončil (kód {code}) po {frames} snímkach — "
+                    f"čierna; nový pokus najskôr o {RETRY_COOLDOWN:.0f} s")
+                retry_after = time.monotonic() + RETRY_COOLDOWN
+                break
+            os.write(dev_fd, frame)
+            frames += 1
+            now = time.monotonic()
+            if now - last_check >= CHECK_PERIOD:
+                last_check = now
+                drain(ino, f"beh f{frames}")
+                exclude = self_pids | descendants(feeder.pid)
+                n = readers(DEV, exclude)
+                if n != last_readers:
+                    log(f"čitateľov {last_readers} → {n} (snímka {frames})")
+                    last_readers = n
+                    write_state(True, n)
+                if n == 0:
+                    if idle_since is None:
+                        idle_since = now
+                    elif now - idle_since >= GRACE_STOP:
+                        log(f"bez čitateľov → zastavujem feeder "
+                            f"({frames} snímok)")
+                        break
+                else:
+                    idle_since = None
+        stop_proc(feeder)
+        feeder = None
+        write_state(False, 0)
+        drain(ino, "koniec")  # udalosti z behu feedera nie sú nové otvorenia
+        os.write(dev_fd, BLACK)
+
+
+if __name__ == "__main__":
+    main()

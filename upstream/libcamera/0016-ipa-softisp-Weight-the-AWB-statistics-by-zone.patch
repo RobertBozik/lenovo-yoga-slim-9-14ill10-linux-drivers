@@ -1,0 +1,130 @@
+From 32b2068f7b76b13d433811a10c1ebb90c6b24e7e Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Thu, 27 Aug 2026 08:59:04 +0000
+Subject: [PATCH 16/16] ipa: softisp: Weight the AWB statistics by zone
+
+The white balance estimates the grey point from the mean of the whole
+frame, and a large face or a coloured sofa pulls it: the same wall comes
+out magenta, blue or green depending on how the scene is framed.
+
+With zoneWeighting: true in the tuning file, the estimate is a weighted
+mean of the statistics zones instead. Bright zones weigh more (walls,
+ceilings and paper are the likely neutral surfaces), zones strongly
+coloured after the current white balance weigh less, and zones near
+black or clipped are ignored.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/awb.cpp | 65 ++++++++++++++++++++++++++++++
+ src/ipa/softisp/algorithms/awb.h   |  2 +
+ 2 files changed, 67 insertions(+)
+
+diff --git a/src/ipa/softisp/algorithms/awb.cpp b/src/ipa/softisp/algorithms/awb.cpp
+index 55fd326..b1c2bab 100644
+--- a/src/ipa/softisp/algorithms/awb.cpp
++++ b/src/ipa/softisp/algorithms/awb.cpp
+@@ -7,7 +7,10 @@
+ 
+ #include "awb.h"
+ 
++#include <array>
++#include <cmath>
+ #include <numeric>
++#include <vector>
+ #include <stdint.h>
+ 
+ #include <libcamera/base/log.h>
+@@ -74,8 +77,22 @@ private:
+ /**
+  * \copydoc libcamera::ipa::Algorithm::init
+  */
++/*
++ * Zone weighting (zoneWeighting: true in the tuning file): instead of the
++ * mean of the whole frame, the grey estimate is a weighted mean of the
++ * statistics zones. Bright zones weigh more (walls, ceilings and paper are
++ * the likely neutral surfaces, and they dominate the brightest zones),
++ * zones that are strongly coloured after the current white balance weigh
++ * less (a face, a coloured sofa), and zones near black or clipped are
++ * ignored. This keeps a large face or a coloured background from pulling
++ * the balance, which the plain frame mean cannot.
++ */
++static constexpr double kZoneColourSigma = 0.35;
++static constexpr double kZoneClipFraction = 0.9;
++
+ int Awb::init(IPAContext &context, const ValueNode &tuningData)
+ {
++	zoneWeighting_ = tuningData["zoneWeighting"].get<bool>(false);
+ 	return awbAlgo_.init(tuningData, context.ctrlMap);
+ }
+ 
+@@ -121,6 +138,54 @@ SoftIspAwbStats Awb::calculateRgbMeans(IPAContext &context,
+ 	const SwIspStats::Histogram &histogram = stats->yHistogram;
+ 	const uint8_t blackLevel = context.activeState.blc.level;
+ 
++	if (zoneWeighting_) {
++		const auto &awb = context.activeState.awb;
++		const RGB<double> &gains = awb.autoEnabled ? awb.automatic.gains
++							   : awb.manual.gains;
++		/* The zone sums are at the bit depth of the input format */
++		const double scale = static_cast<double>(1u << stats->zoneShift);
++		const double black = blackLevel * scale;
++		const double clip = kZoneClipFraction * 256.0 * scale;
++		double maxY = 0.0;
++		std::vector<std::array<double, 4>> means;
++		means.reserve(stats->zones.size());
++		for (const SwIspStats::Zone &zone : stats->zones) {
++			if (zone.count == 0)
++				continue;
++			const double r = static_cast<double>(zone.sumR) / zone.count - black;
++			const double g = static_cast<double>(zone.sumG) / zone.count - black;
++			const double b = static_cast<double>(zone.sumB) / zone.count - black;
++			if (g <= 1.0 || r <= 0.0 || b <= 0.0)
++				continue;
++			if (r + black >= clip || g + black >= clip || b + black >= clip)
++				continue;
++			const double y = 0.299 * r + 0.587 * g + 0.114 * b;
++			maxY = std::max(maxY, y);
++			means.push_back({ r, g, b, y });
++		}
++
++		RGB<double> sum = { { 0.0, 0.0, 0.0 } };
++		double weightSum = 0.0;
++		for (const auto &m : means) {
++			const double rr = m[0] / m[1] * gains.r() / std::max(gains.g(), 1e-3);
++			const double bb = m[2] / m[1] * gains.b() / std::max(gains.g(), 1e-3);
++			const double colour = std::hypot(rr - 1.0, bb - 1.0) / kZoneColourSigma;
++			const double weight = (maxY > 0.0 ? m[3] / maxY : 0.0) *
++					      std::exp(-colour * colour);
++			sum += RGB<double>({ m[0], m[1], m[2] }) * weight;
++			weightSum += weight;
++		}
++
++		if (weightSum > 0.0) {
++			/* Back to the 8-bit scale of the frame means */
++			RGB<double> rgbMeans = sum / weightSum / scale;
++			LOG(IPASoftIspAwb, Debug)
++				<< "Zone weighted means " << rgbMeans
++				<< " from " << means.size() << " zones";
++			return SoftIspAwbStats(rgbMeans);
++		}
++	}
++
+ 	/*
+ 	 * Black level must be subtracted to get the correct AWB ratios, they
+ 	 * would be off if they were computed from the whole brightness range
+diff --git a/src/ipa/softisp/algorithms/awb.h b/src/ipa/softisp/algorithms/awb.h
+index c92bdbf..001b8fb 100644
+--- a/src/ipa/softisp/algorithms/awb.h
++++ b/src/ipa/softisp/algorithms/awb.h
+@@ -51,6 +51,8 @@ private:
+ 	SoftIspAwbStats calculateRgbMeans(IPAContext &context,
+ 					  const SwIspStats *stats) const;
+ 
++	bool zoneWeighting_;
++
+ 	/*
+ 	 * There actually is no Q register format for SoftISP, but allow the
+ 	 * colour gains to range in the [0.0f, 3.999f] interval, which seems
+-- 
+2.43.0
+

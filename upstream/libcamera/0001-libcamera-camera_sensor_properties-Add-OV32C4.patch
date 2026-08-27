@@ -1,0 +1,41 @@
+From d838116536898463a48aaf5b81124c9ad3480279 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Mon, 24 Aug 2026 13:33:09 +0000
+Subject: [PATCH 1/7] libcamera: camera_sensor_properties: Add OV32C4
+
+The OmniVision OV32C4 is a 32 megapixel RGBC sensor used as an
+under-display camera in laptops, behind an Intel IPU. Its kernel driver
+was submitted to linux-media.
+
+The unit cell size is the 0.702 um pixel pitch from the vendor product
+brief; it agrees with the 6528x4896 active array the same brief lists
+and with the crop rectangle the driver reports.
+
+No test pattern modes are listed because the driver does not implement
+V4L2_CID_TEST_PATTERN, and the sensor delays are left at the libcamera
+defaults because they have not been measured.
+
+Signed-off-by: Robert Bozik <robertbozik@gmail.com>
+---
+ src/libcamera/sensor/camera_sensor_properties.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index 819f07bb..9c3dd565 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -412,6 +412,11 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 			},
+ 			.sensorDelays = { },
+ 		} },
++		{ "ov32c4", {
++			.unitCellSize = { 702, 702 },
++			.testPatternModes = {},
++			.sensorDelays = { },
++		} },
+ 		{ "ov4689", {
+ 			.unitCellSize = { 2000, 2000 },
+ 			.testPatternModes = {
+-- 
+2.53.0
+

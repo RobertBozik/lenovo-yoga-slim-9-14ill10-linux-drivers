@@ -1,0 +1,65 @@
+From dbb39207f36a667acefe860a6efaec6b270ea009 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Wed, 26 Aug 2026 16:32:33 +0000
+Subject: [PATCH] ipa: softisp: Let the tuning file set the default saturation
+
+The colour correction matrices of a module can render the colours more
+saturated than the scene calls for, and applications rarely expose the
+Saturation control. Let the tuning file set the saturation the camera
+starts with (saturation, 1.0 keeps the current behaviour); the control
+still overrides it.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/adjust.cpp | 15 ++++++++++++++-
+ src/ipa/softisp/algorithms/adjust.h   |  1 +
+ 2 files changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/src/ipa/softisp/algorithms/adjust.cpp b/src/ipa/softisp/algorithms/adjust.cpp
+index 5aaf115..3ba24d7 100644
+--- a/src/ipa/softisp/algorithms/adjust.cpp
++++ b/src/ipa/softisp/algorithms/adjust.cpp
+@@ -40,6 +40,12 @@ static constexpr float kDefaultGammaOffset = 0.0f;
+ int Adjust::init(IPAContext &context, const ValueNode &tuningData)
+ {
+ 	gammaOffset_ = tuningData["gammaOffset"].get<double>(kDefaultGammaOffset);
++	defaultSaturation_ = tuningData["saturation"].get<double>(kDefaultSaturation);
++	if (defaultSaturation_ < 0.0f || defaultSaturation_ > 2.0f) {
++		LOG(IPASoftIspAdjust, Warning)
++			<< "saturation must be in [0, 2], ignored";
++		defaultSaturation_ = kDefaultSaturation;
++	}
+ 	if (gammaOffset_ < 0.0f || gammaOffset_ >= 1.0f) {
+ 		LOG(IPASoftIspAdjust, Warning)
+ 			<< "gammaOffset must be in [0, 1[, ignored";
+@@ -61,7 +67,14 @@ int Adjust::configure(IPAContext &context,
+ {
+ 	context.activeState.knobs.gamma = kDefaultGamma;
+ 	context.activeState.knobs.contrast = std::optional<float>();
+-	context.activeState.knobs.saturation = std::optional<float>();
++	/*
++	 * The tuning file can set the saturation the camera starts with; the
++	 * Saturation control still overrides it.
++	 */
++	if (defaultSaturation_ != kDefaultSaturation)
++		context.activeState.knobs.saturation = defaultSaturation_;
++	else
++		context.activeState.knobs.saturation = std::optional<float>();
+ 
+ 	return 0;
+ }
+diff --git a/src/ipa/softisp/algorithms/adjust.h b/src/ipa/softisp/algorithms/adjust.h
+index 83b7e10..33aedf2 100644
+--- a/src/ipa/softisp/algorithms/adjust.h
++++ b/src/ipa/softisp/algorithms/adjust.h
+@@ -45,6 +45,7 @@ private:
+ 	void applySaturation(Matrix<float, 3, 3> &ccm, float saturation);
+ 
+ 	float gammaOffset_;
++	float defaultSaturation_;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */
+-- 
+2.43.0
+

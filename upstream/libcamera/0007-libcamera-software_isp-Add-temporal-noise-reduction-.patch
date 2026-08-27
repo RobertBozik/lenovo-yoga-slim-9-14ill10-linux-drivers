@@ -1,0 +1,660 @@
+From 79905a286f9c83cf0e6fbedb8dd94a1a0de149f9 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Tue, 25 Aug 2026 11:36:41 +0000
+Subject: [PATCH 7/7] libcamera: software_isp: Add temporal noise reduction to
+ the GPU debayer
+
+Under-display and other small sensors run at maximum gain in ordinary
+room light, and the software ISP then applies a digital gain on top.
+The resulting noise is not only visible as grain: the noise around the
+black level is symmetric, but once the black level is subtracted the
+negative half is clamped to zero, leaving a positive bias that lifts the
+blacks and desaturates the colours. Averaging frames before that
+subtraction removes both.
+
+Add a temporal noise reduction pass to the EGL debayer for the unpacked
+Bayer formats. The raw frame is blended with the previously filtered one
+into a history texture, and the debayer shader then samples the filtered
+frame instead of the raw input. Motion is detected on the mean of the
+4x4 block around each pixel: where the current frame differs from the
+history by more than a few sigmas of the noise expected for that block,
+the current frame is used as is, so that moving edges do not ghost.
+
+The history is an RGBA8 texture, which every GLES 2.0 implementation can
+render to, laid out like the raw input texture (low byte, high byte) so
+that the debayer shader decodes either with the same code; the fraction
+of the filtered value is kept in the third channel for the precision of
+the recursive filter.
+
+The parameters come from a new Denoise IPA algorithm: alpha is the
+weight of the current frame (1.0 disables the filter); noiseSlope and
+noiseFloor describe the sensor noise model at unity analogue gain
+(variance in normalised raw units = noiseSlope * signal + noiseFloor),
+which the IPA scales for the analogue gain in use; motionSigma is the
+number of noise sigmas of the block mean above which a pixel is treated
+as moving. The CPU debayer ignores the parameters for now.
+
+Signed-off-by: Robert Bozik <robertbozik@gmail.com>
+---
+ .../internal/software_isp/debayer_params.h    |  14 ++
+ src/ipa/softisp/algorithms/denoise.cpp        |  89 +++++++++
+ src/ipa/softisp/algorithms/denoise.h          |  36 ++++
+ src/ipa/softisp/algorithms/meson.build        |   1 +
+ src/ipa/softisp/softisp.cpp                   |   1 +
+ src/libcamera/shaders/meson.build             |   1 +
+ src/libcamera/shaders/temporal.frag           | 131 +++++++++++++
+ src/libcamera/software_isp/debayer.cpp        |  13 ++
+ src/libcamera/software_isp/debayer_egl.cpp    | 172 ++++++++++++++++++
+ src/libcamera/software_isp/debayer_egl.h      |  23 +++
+ 10 files changed, 481 insertions(+)
+ create mode 100644 src/ipa/softisp/algorithms/denoise.cpp
+ create mode 100644 src/ipa/softisp/algorithms/denoise.h
+ create mode 100644 src/libcamera/shaders/temporal.frag
+
+diff --git a/include/libcamera/internal/software_isp/debayer_params.h b/include/libcamera/internal/software_isp/debayer_params.h
+index 1074720d..3ba794a3 100644
+--- a/include/libcamera/internal/software_isp/debayer_params.h
++++ b/include/libcamera/internal/software_isp/debayer_params.h
+@@ -25,6 +25,20 @@ struct DebayerParams {
+ 	float gamma = 1.0;
+ 	float contrastExp = 1.0;
+ 	RGB<double> gains = RGB<double>({ 1.0, 1.0, 1.0 });
++	/*
++	 * Temporal noise reduction of the raw data. alpha is the weight of
++	 * the current frame (1.0 disables the filter). Motion is detected
++	 * where the frame differs from the history by more than motionSigma
++	 * times the expected noise, whose variance in normalised raw units is
++	 * noiseSlope * signal + noiseFloor (signal above black level, already
++	 * scaled for the current analogue gain).
++	 */
++	struct {
++		float alpha = 1.0;
++		float noiseSlope = 0.0;
++		float noiseFloor = 0.0;
++		float motionSigma = 0.0;
++	} temporalDenoise;
+ };
+ 
+ } /* namespace libcamera */
+diff --git a/src/ipa/softisp/algorithms/denoise.cpp b/src/ipa/softisp/algorithms/denoise.cpp
+new file mode 100644
+index 00000000..a13440f6
+--- /dev/null
++++ b/src/ipa/softisp/algorithms/denoise.cpp
+@@ -0,0 +1,89 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Robert Bozik
++ *
++ * Temporal noise reduction parameters
++ */
++
++#include "denoise.h"
++
++#include <algorithm>
++
++#include <libcamera/base/log.h>
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(IPASoftIspDenoise)
++
++namespace ipa::softisp::algorithms {
++
++/*
++ * Temporal noise reduction blends each raw frame with the previously
++ * filtered one, before black level subtraction. The tuning file provides:
++ *
++ * - alpha: weight of the current frame, in ]0, 1]. Lower values average
++ *   more frames (the noise standard deviation drops by roughly
++ *   sqrt(alpha / (2 - alpha))) but react slower to changes; 1.0 disables
++ *   the filter.
++ * - noiseSlope, noiseFloor: sensor noise model at unity analogue gain,
++ *   in normalised raw units: variance = noiseSlope * gain * signal +
++ *   noiseFloor * gain^2, with the signal above the black level. The
++ *   slope is the shot noise, the floor the read noise. Both are measured
++ *   from the difference of consecutive frames of a static scene.
++ * - motionSigma: difference between the current frame and the history,
++ *   in sigmas of that noise, above which a pixel is considered to have
++ *   moved and the current frame is used as is.
++ */
++static constexpr float kDefaultAlpha = 1.0f;
++static constexpr float kDefaultMotionSigma = 3.0f;
++
++int Denoise::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	alpha_ = tuningData["alpha"].get<double>(kDefaultAlpha);
++	noiseSlope_ = tuningData["noiseSlope"].get<double>(0.0);
++	noiseFloor_ = tuningData["noiseFloor"].get<double>(0.0);
++	motionSigma_ = tuningData["motionSigma"].get<double>(kDefaultMotionSigma);
++
++	if (alpha_ <= 0.0f || alpha_ > 1.0f) {
++		LOG(IPASoftIspDenoise, Error)
++			<< "alpha must be in ]0, 1], got " << alpha_;
++		return -EINVAL;
++	}
++	if (noiseSlope_ < 0.0f || noiseFloor_ < 0.0f || motionSigma_ <= 0.0f) {
++		LOG(IPASoftIspDenoise, Error)
++			<< "noiseSlope and noiseFloor must not be negative, "
++			<< "motionSigma must be positive";
++		return -EINVAL;
++	}
++	if (alpha_ < 1.0f && noiseSlope_ == 0.0f && noiseFloor_ == 0.0f) {
++		LOG(IPASoftIspDenoise, Error)
++			<< "A noise model (noiseSlope/noiseFloor) is required "
++			<< "for temporal denoising";
++		return -EINVAL;
++	}
++
++	LOG(IPASoftIspDenoise, Info)
++		<< "Temporal denoise alpha " << alpha_
++		<< " noise slope " << noiseSlope_ << " floor " << noiseFloor_
++		<< " motion " << motionSigma_ << " sigma";
++
++	return 0;
++}
++
++void Denoise::prepare(IPAContext &context, [[maybe_unused]] const uint32_t frame,
++		      [[maybe_unused]] IPAFrameContext &frameContext,
++		      DebayerParams *params)
++{
++	const double gain = std::max(context.activeState.agc.again, 1.0);
++
++	params->temporalDenoise.alpha = alpha_;
++	params->temporalDenoise.noiseSlope = noiseSlope_ * gain;
++	params->temporalDenoise.noiseFloor = noiseFloor_ * gain * gain;
++	params->temporalDenoise.motionSigma = motionSigma_;
++}
++
++REGISTER_IPA_ALGORITHM(Denoise, "Denoise")
++
++} /* namespace ipa::softisp::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/softisp/algorithms/denoise.h b/src/ipa/softisp/algorithms/denoise.h
+new file mode 100644
+index 00000000..34c03fe4
+--- /dev/null
++++ b/src/ipa/softisp/algorithms/denoise.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Robert Bozik
++ *
++ * Temporal noise reduction parameters
++ */
++
++#pragma once
++
++#include "algorithm.h"
++
++namespace libcamera {
++
++namespace ipa::softisp::algorithms {
++
++class Denoise : public Algorithm
++{
++public:
++	Denoise() = default;
++	~Denoise() = default;
++
++	int init(IPAContext &context, const ValueNode &tuningData) override;
++	void prepare(IPAContext &context, const uint32_t frame,
++		     IPAFrameContext &frameContext,
++		     DebayerParams *params) override;
++
++private:
++	float alpha_;
++	float noiseSlope_;
++	float noiseFloor_;
++	float motionSigma_;
++};
++
++} /* namespace ipa::softisp::algorithms */
++
++} /* namespace libcamera */
+diff --git a/src/ipa/softisp/algorithms/meson.build b/src/ipa/softisp/algorithms/meson.build
+index d240409e..ea87afa8 100644
+--- a/src/ipa/softisp/algorithms/meson.build
++++ b/src/ipa/softisp/algorithms/meson.build
+@@ -6,4 +6,5 @@ softisp_ipa_algorithms = files([
+     'agc.cpp',
+     'blc.cpp',
+     'ccm.cpp',
++    'denoise.cpp',
+ ])
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 6d6b80d5..80155d19 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -164,6 +164,7 @@ int IPASoftIsp::init(const IPASettings &settings,
+ 		params_->gamma = 1.0 / algorithms::kDefaultGamma;
+ 		params_->contrastExp = 1.0;
+ 		params_->gains = { { 1.0, 1.0, 1.0 } };
++		params_->temporalDenoise = {};
+ 		/* combinedMatrix is reset for each frame. */
+ 	}
+ 
+diff --git a/src/libcamera/shaders/meson.build b/src/libcamera/shaders/meson.build
+index c409ff9b..147a2ac9 100644
+--- a/src/libcamera/shaders/meson.build
++++ b/src/libcamera/shaders/meson.build
+@@ -7,6 +7,7 @@ shader_files = files([
+     'bayer_unpacked.frag',
+     'bayer_unpacked.vert',
+     'identity.vert',
++    'temporal.frag',
+ ])
+ 
+ # Generate header from shaders
+diff --git a/src/libcamera/shaders/temporal.frag b/src/libcamera/shaders/temporal.frag
+new file mode 100644
+index 00000000..ec7611cb
+--- /dev/null
++++ b/src/libcamera/shaders/temporal.frag
+@@ -0,0 +1,131 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026, Robert Bozik
++ *
++ * temporal.frag - Temporal noise reduction of raw Bayer data
++ *
++ * Blends the current raw frame with the previously filtered one, before
++ * black level subtraction, so that the noise is averaged before any
++ * clamping rectifies it. Where the frame changed by more than a few
++ * sigmas of the expected sensor noise the current frame is used as is,
++ * to avoid ghosting on motion.
++ *
++ * The filtered frame is kept in an RGBA8 texture, which every GLES 2.0
++ * implementation can render to, laid out like the raw input so that the
++ * debayer shader can sample either.
++ */
++
++#ifdef GL_ES
++precision highp float;
++#endif
++
++uniform sampler2D tex_y;      /* Current raw frame */
++uniform sampler2D tex_hist;   /* Previous filtered frame, packed */
++uniform float alpha;          /* Weight of the current frame */
++uniform float noise_a;        /* Noise variance per unit of signal */
++uniform float noise_b;        /* Noise variance floor */
++uniform float motion_k;       /* Motion threshold in noise sigmas */
++uniform float black;          /* Black level, normalised */
++uniform float hist_valid;     /* 0.0 on the first frame */
++
++varying vec2 textureOut;
++
++/*
++ * The history texture is RGBA8 and holds the filtered value in the same
++ * layout as the raw input texture, so that the debayer shader samples
++ * either one with the same decoding: for the unpacked 10 and 12 bit
++ * formats the low byte in .r and the high byte in .g, for 8 bit formats
++ * the value in .r. The fraction of the value is kept in .b for the
++ * precision of the recursive filter; the debayer shader ignores it.
++ *
++ * The decoding mirrors bayer_unpacked.frag: (lo + 256 * hi) / 1020 for
++ * 10 bit, (lo + 256 * hi) / 4080 for 12 bit.
++ */
++#if defined(RAW10P)
++#define RAW_SCALE 1020.0
++#elif defined(RAW12P)
++#define RAW_SCALE 4080.0
++#endif
++
++#if defined(RAW_SCALE)
++float fetch_cur(vec2 uv)
++{
++	vec4 p = texture2D(tex_y, uv);
++	return (p.r * 255.0 + p.g * 255.0 * 256.0) / RAW_SCALE;
++}
++
++float fetch_hist(vec2 uv)
++{
++	vec4 p = texture2D(tex_hist, uv);
++	return (p.r * 255.0 + p.g * 255.0 * 256.0 + p.b) / RAW_SCALE;
++}
++
++vec4 pack_hist(float v)
++{
++	float raw = clamp(v, 0.0, 1.0) * RAW_SCALE;
++	float ip = floor(raw);
++	float hi = floor(ip / 256.0);
++	float lo = ip - hi * 256.0;
++	return vec4(lo / 255.0, hi / 255.0, raw - ip, 1.0);
++}
++#else
++float fetch_cur(vec2 uv)
++{
++	return texture2D(tex_y, uv).r;
++}
++
++float fetch_hist(vec2 uv)
++{
++	vec4 p = texture2D(tex_hist, uv);
++	return p.r + p.b / 255.0;
++}
++
++vec4 pack_hist(float v)
++{
++	float raw = clamp(v, 0.0, 1.0) * 255.0;
++	float ip = floor(raw);
++	return vec4(ip / 255.0, 0.0, raw - ip, 1.0);
++}
++#endif
++
++uniform vec2 tex_step;        /* 1 / texture size, one texel */
++
++void main(void)
++{
++	float cur = fetch_cur(textureOut);
++	float prev = fetch_hist(textureOut);
++
++	/*
++	 * Detect motion on the mean of the 4x4 block around the pixel (two
++	 * Bayer quads each way) rather than on the pixel alone: the noise of
++	 * the mean is a quarter of that of a pixel, so the threshold can sit
++	 * close to the real noise and still catch subtle motion, such as the
++	 * trailing edge of an object over a background of similar brightness.
++	 */
++	float curMean = 0.0;
++	float prevMean = 0.0;
++	for (int j = -1; j <= 2; j++) {
++		for (int i = -1; i <= 2; i++) {
++			vec2 uv = textureOut + vec2(float(i) * tex_step.x, float(j) * tex_step.y);
++			curMean += fetch_cur(uv);
++			prevMean += fetch_hist(uv);
++		}
++	}
++	curMean *= 1.0 / 16.0;
++	prevMean *= 1.0 / 16.0;
++	float diff = abs(curMean - prevMean);
++
++	/*
++	 * Expected noise of the block mean from the sensor noise model: the
++	 * variance grows with the signal (shot noise), and the mean of 16
++	 * pixels has a sixteenth of the variance of one.
++	 */
++	float signal = max(prevMean - black, 0.0);
++	float sigma = sqrt((noise_a * signal + noise_b) / 16.0);
++	float threshold = motion_k * sigma;
++
++	float w = mix(alpha, 1.0, smoothstep(threshold, 1.5 * threshold, diff));
++	float v = hist_valid > 0.5 ? mix(prev, cur, w) : cur;
++
++	gl_FragColor = pack_hist(v);
++}
+diff --git a/src/libcamera/software_isp/debayer.cpp b/src/libcamera/software_isp/debayer.cpp
+index a4854e51..4a17515c 100644
+--- a/src/libcamera/software_isp/debayer.cpp
++++ b/src/libcamera/software_isp/debayer.cpp
+@@ -43,6 +43,19 @@ namespace libcamera {
+  * \brief Contrast value to be used as an exponent
+  */
+ 
++/**
++ * \var DebayerParams::temporalDenoise
++ * \brief Temporal noise reduction parameters
++ *
++ * The raw frame is blended with the filtered history before debayering.
++ * alpha is the weight of the current frame (1.0 disables the filter).
++ * Motion is detected where the frame differs from the history by more than
++ * motionSigma times the expected noise standard deviation, whose variance
++ * in normalised raw units is noiseSlope * signal + noiseFloor, the signal
++ * being measured above the black level and scaled for the current analogue
++ * gain.
++ */
++
+ /**
+  * \class Debayer
+  * \brief Base debayering class
+diff --git a/src/libcamera/software_isp/debayer_egl.cpp b/src/libcamera/software_isp/debayer_egl.cpp
+index 97aa0379..913685b1 100644
+--- a/src/libcamera/software_isp/debayer_egl.cpp
++++ b/src/libcamera/software_isp/debayer_egl.cpp
+@@ -238,6 +238,23 @@ int DebayerEGL::initBayerShaders(PixelFormat inputFormat, PixelFormat outputForm
+ 		break;
+ 	};
+ 
++	/*
++	 * The temporal noise reduction pass writes the filtered raw frame to
++	 * an RGBA8 texture laid out like the raw input, which the debayer
++	 * shader then samples instead of the raw input with the same decoding.
++	 * It is only implemented for the unpacked formats handled by the
++	 * bayer_unpacked shader.
++	 */
++	temporalSupported_ = false;
++	if (fragmentShaderData.data() == bayer_unpacked_frag.data()) {
++		if (initTemporalShaders(shaderEnv) == 0) {
++			temporalSupported_ = true;
++		} else {
++			LOG(Debayer, Warning)
++				<< "Temporal noise reduction unavailable";
++		}
++	}
++
+ 	if (egl_.compileVertexShader(vertexShaderId_, vertexShaderData,
+ 				     shaderEnv)) {
+ 		LOG(Debayer, Error) << "Compile vertex shader fail";
+@@ -488,6 +505,144 @@ void DebayerEGL::setShaderVariableValues(eGLImage &eglImageIn, const DebayerPara
+ 	return;
+ }
+ 
++int DebayerEGL::initTemporalShaders(const std::vector<std::string> &shaderEnv)
++{
++	GLuint vertexShaderId = 0;
++	GLuint fragmentShaderId = 0;
++
++	if (egl_.compileVertexShader(vertexShaderId, identity_vert, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile temporal vertex shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit vShaderGuard([&] { glDeleteShader(vertexShaderId); });
++
++	if (egl_.compileFragmentShader(fragmentShaderId, temporal_frag, shaderEnv)) {
++		LOG(Debayer, Error) << "Compile temporal fragment shader fail";
++		return -ENODEV;
++	}
++	utils::scope_exit fShaderGuard([&] { glDeleteShader(fragmentShaderId); });
++
++	if (egl_.linkProgram(temporalProgramId_, vertexShaderId, fragmentShaderId)) {
++		LOG(Debayer, Error) << "Linking temporal program fail";
++		return -ENODEV;
++	}
++
++	temporalAttributeVertex_ = glGetAttribLocation(temporalProgramId_, "vertexIn");
++	temporalAttributeTexture_ = glGetAttribLocation(temporalProgramId_, "textureIn");
++	temporalUniformProjMatrix_ = glGetUniformLocation(temporalProgramId_, "proj_matrix");
++	temporalUniformStrideFactor_ = glGetUniformLocation(temporalProgramId_, "stride_factor");
++	temporalUniformDataIn_ = glGetUniformLocation(temporalProgramId_, "tex_y");
++	temporalUniformHist_ = glGetUniformLocation(temporalProgramId_, "tex_hist");
++	temporalUniformAlpha_ = glGetUniformLocation(temporalProgramId_, "alpha");
++	temporalUniformNoiseA_ = glGetUniformLocation(temporalProgramId_, "noise_a");
++	temporalUniformNoiseB_ = glGetUniformLocation(temporalProgramId_, "noise_b");
++	temporalUniformMotionK_ = glGetUniformLocation(temporalProgramId_, "motion_k");
++	temporalUniformBlack_ = glGetUniformLocation(temporalProgramId_, "black");
++	temporalUniformHistValid_ = glGetUniformLocation(temporalProgramId_, "hist_valid");
++	temporalUniformStep_ = glGetUniformLocation(temporalProgramId_, "tex_step");
++
++	/*
++	 * Two history textures, the same size as the input texture so that
++	 * the debayer shader can sample the filtered frame with the
++	 * coordinates it computes for the raw input.
++	 */
++	const uint32_t histWidth = inputConfig_.stride / bytesPerPixel_;
++	for (unsigned int i = 0; i < 2; i++) {
++		temporalHistory_[i] = std::make_unique<eGLImage>(GL_RGBA, histWidth, height_,
++								 histWidth * 4,
++								 GL_TEXTURE2 + i, 2 + i);
++		egl_.createOutputTexture2D(*temporalHistory_[i]);
++	}
++
++	GLenum err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(Debayer, Error) << "Temporal history textures error " << err;
++		return -ENODEV;
++	}
++
++	return 0;
++}
++
++/*
++ * Blend the raw input with the previous filtered frame into the other
++ * history texture, and return 0 with the debayer input redirected to it.
++ * With alpha at 1.0 the filter is disabled and the history reset, so that
++ * re-enabling it doesn't blend with a stale frame.
++ */
++int DebayerEGL::temporalPass(eGLImage &eglImageIn, const DebayerParams &params)
++{
++	if (params.temporalDenoise.alpha >= 1.0f) {
++		temporalHistoryValid_ = false;
++		temporalActive_ = false;
++		return 0;
++	}
++
++	eGLImage &prev = *temporalHistory_[temporalIndex_];
++	eGLImage &next = *temporalHistory_[temporalIndex_ ^ 1];
++
++	glUseProgram(temporalProgramId_);
++
++	static const GLfloat identityMatrix[] = {
++		1, 0, 0, 0,
++		0, 1, 0, 0,
++		0, 0, 1, 0,
++		0, 0, 0, 1
++	};
++	static const GLfloat vcoordinates[4][2] = {
++		{ -1.0f, -1.0f },
++		{ -1.0f, +1.0f },
++		{ +1.0f, +1.0f },
++		{ +1.0f, -1.0f },
++	};
++	static const GLfloat tcoordinates[4][2] = {
++		{ 0.0f, 0.0f },
++		{ 0.0f, 1.0f },
++		{ 1.0f, 1.0f },
++		{ 1.0f, 0.0f },
++	};
++
++	glEnableVertexAttribArray(temporalAttributeVertex_);
++	glVertexAttribPointer(temporalAttributeVertex_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), vcoordinates);
++	glEnableVertexAttribArray(temporalAttributeTexture_);
++	glVertexAttribPointer(temporalAttributeTexture_, 2, GL_FLOAT, GL_TRUE,
++			      2 * sizeof(GLfloat), tcoordinates);
++
++	egl_.activateBindTexture(eglImageIn);
++	egl_.activateBindTexture(prev);
++	glUniform1i(temporalUniformDataIn_, eglImageIn.texture_unit_uniform_id_);
++	glUniform1i(temporalUniformHist_, prev.texture_unit_uniform_id_);
++	glUniformMatrix4fv(temporalUniformProjMatrix_, 1, GL_FALSE, identityMatrix);
++	glUniform1f(temporalUniformStrideFactor_, 1.0f);
++	glUniform1f(temporalUniformAlpha_, params.temporalDenoise.alpha);
++	glUniform1f(temporalUniformNoiseA_, params.temporalDenoise.noiseSlope);
++	glUniform1f(temporalUniformNoiseB_, params.temporalDenoise.noiseFloor);
++	glUniform1f(temporalUniformMotionK_, params.temporalDenoise.motionSigma);
++	glUniform1f(temporalUniformBlack_, static_cast<float>(params.blackLevel.g()));
++	glUniform1f(temporalUniformHistValid_, temporalHistoryValid_ ? 1.0f : 0.0f);
++	glUniform2f(temporalUniformStep_, 1.0f / prev.width_, 1.0f / prev.height_);
++
++	if (egl_.attachTextureToFBO(next))
++		return -ENODEV;
++
++	glViewport(0, 0, next.width_, next.height_);
++	glDrawArrays(GL_TRIANGLE_FAN, 0, DEBAYER_OPENGL_COORDS);
++
++	GLenum err = glGetError();
++	if (err != GL_NO_ERROR) {
++		LOG(eGL, Error) << "Temporal pass fail " << err;
++		return -ENODEV;
++	}
++
++	temporalIndex_ ^= 1;
++	temporalHistoryValid_ = true;
++	temporalActive_ = true;
++
++	glUseProgram(programId_);
++
++	return 0;
++}
++
+ eGLImage *DebayerEGL::getCachedInputFrameBuffer(FrameBuffer *input, std::optional<MappedFrameBuffer> *inMapped, std::optional<DmaSyncer> *inDmaSyncer)
+ {
+ 	const SharedFD &fd = input->planes()[0].fd;
+@@ -585,8 +740,16 @@ int DebayerEGL::debayerGPU(FrameBuffer *input, FrameBuffer *output, const Debaye
+ 	if (!eglImageOut)
+ 		return -ENOMEM;
+ 
++	if (temporalSupported_ && temporalPass(*eglImageIn, params))
++		return -ENODEV;
++
+ 	egl_.attachTextureToFBO(*eglImageOut);
+ 	setShaderVariableValues(*eglImageIn, params);
++	if (temporalActive_) {
++		eGLImage &filtered = *temporalHistory_[temporalIndex_];
++		egl_.activateBindTexture(filtered);
++		glUniform1i(textureUniformBayerDataIn_, filtered.texture_unit_uniform_id_);
++	}
+ 
+ 	glViewport(0, 0, width_, height_);
+ 	glClear(GL_COLOR_BUFFER_BIT);
+@@ -677,6 +840,15 @@ void DebayerEGL::stop()
+ {
+ 	eglImageOutCache_.clear();
+ 	eglImageInCache_.clear();
++	temporalHistory_[0].reset();
++	temporalHistory_[1].reset();
++	temporalHistoryValid_ = false;
++	temporalActive_ = false;
++
++	if (temporalProgramId_) {
++		glDeleteProgram(temporalProgramId_);
++		temporalProgramId_ = 0;
++	}
+ 
+ 	if (programId_)
+ 		glDeleteProgram(programId_);
+diff --git a/src/libcamera/software_isp/debayer_egl.h b/src/libcamera/software_isp/debayer_egl.h
+index 30e51a47..c273b0ee 100644
+--- a/src/libcamera/software_isp/debayer_egl.h
++++ b/src/libcamera/software_isp/debayer_egl.h
+@@ -64,6 +64,8 @@ public:
+ private:
+ 	static int getInputConfig(PixelFormat inputFormat, DebayerInputConfig &config);
+ 	int initBayerShaders(PixelFormat inputFormat, PixelFormat outputFormat);
++	int initTemporalShaders(const std::vector<std::string> &shaderEnv);
++	int temporalPass(eGLImage &eglImageIn, const DebayerParams &params);
+ 	int getShaderVariableLocations();
+ 	void setShaderVariableValues(eGLImage &eGLImageIn, const DebayerParams &params);
+ 	int debayerGPU(FrameBuffer *input, FrameBuffer *output, const DebayerParams &params, std::optional<MappedFrameBuffer> *mappedInputBuffer, std::optional<DmaSyncer> *inputBufferDmaSyncer);
+@@ -76,6 +78,27 @@ private:
+ 	GLuint fragmentShaderId_ = 0;
+ 	GLuint programId_ = 0;
+ 
++	/* Temporal noise reduction pass */
++	bool temporalSupported_ = false;
++	GLuint temporalProgramId_ = 0;
++	GLint temporalAttributeVertex_ = -1;
++	GLint temporalAttributeTexture_ = -1;
++	GLint temporalUniformProjMatrix_ = -1;
++	GLint temporalUniformStrideFactor_ = -1;
++	GLint temporalUniformDataIn_ = -1;
++	GLint temporalUniformHist_ = -1;
++	GLint temporalUniformAlpha_ = -1;
++	GLint temporalUniformNoiseA_ = -1;
++	GLint temporalUniformNoiseB_ = -1;
++	GLint temporalUniformMotionK_ = -1;
++	GLint temporalUniformBlack_ = -1;
++	GLint temporalUniformHistValid_ = -1;
++	GLint temporalUniformStep_ = -1;
++	std::unique_ptr<eGLImage> temporalHistory_[2];
++	unsigned int temporalIndex_ = 0;
++	bool temporalHistoryValid_ = false;
++	bool temporalActive_ = false;
++
+ 	/* Pointer to object representing input texture */
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageInCache_;
+ 	std::deque<std::pair<SharedFD, std::unique_ptr<eGLImage>>> eglImageOutCache_;
+-- 
+2.53.0
+

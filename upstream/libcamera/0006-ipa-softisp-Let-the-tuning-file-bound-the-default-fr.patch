@@ -1,0 +1,98 @@
+From 55f07f73b04dc542fcd7bdf22946b401822d6be7 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Tue, 25 Aug 2026 11:18:58 +0000
+Subject: [PATCH 6/7] ipa: softisp: Let the tuning file bound the default frame
+ duration
+
+Applications that don't set FrameDurationLimits get the full range the
+sensor mode supports, so in low light the AGC lengthens the frame as far
+as the sensor allows. Not all applications that omit the control expect
+that: the PipeWire libcamera source, for instance, negotiates a frame
+rate with its clients but never passes it to libcamera, and a video call
+would then drop to a frame every second in a dim room.
+
+Add a maxFrameDuration tuning parameter (in microseconds) that bounds
+the maximum frame duration used when no FrameDurationLimits control is
+set. Explicit FrameDurationLimits keep allowing the full sensor range.
+
+Signed-off-by: Robert Bozik <robertbozik@gmail.com>
+---
+ src/ipa/softisp/algorithms/agc.cpp | 24 ++++++++++++++++++++++++
+ src/ipa/softisp/algorithms/agc.h   |  5 +++++
+ 2 files changed, 29 insertions(+)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index b6fc7203..0037fa6e 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -84,6 +84,15 @@ static constexpr float kExpMaxJump = 2.0;
+  */
+ static constexpr double kDefaultMaxDigitalGain = 1.0;
+ 
++/*
++ * Applications that don't set FrameDurationLimits get the full range the
++ * sensor supports, which lets the AGC slow the frame rate down to whatever
++ * the sensor allows in low light. That is rarely what an application which
++ * didn't ask for it expects, so the tuning file can bound the default
++ * maximum frame duration with maxFrameDuration (in microseconds); explicit
++ * FrameDurationLimits still allow the full sensor range.
++ */
++
+ Agc::Agc()
+ {
+ }
+@@ -91,6 +100,17 @@ Agc::Agc()
+ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ {
+ 	maxDigitalGain_ = tuningData["maxDigitalGain"].get<double>(kDefaultMaxDigitalGain);
++
++	const auto tuningMaxFrameDuration = tuningData["maxFrameDuration"].get<uint32_t>();
++	if (tuningMaxFrameDuration) {
++		if (*tuningMaxFrameDuration == 0) {
++			LOG(IPASoftIspExposure, Warning)
++				<< "maxFrameDuration must be positive, ignored";
++		} else {
++			defaultMaxFrameDuration_ =
++				std::chrono::microseconds(*tuningMaxFrameDuration);
++		}
++	}
+ 	if (maxDigitalGain_ < 1.0) {
+ 		LOG(IPASoftIspExposure, Warning)
+ 			<< "maxDigitalGain " << maxDigitalGain_ << " below 1.0, ignored";
+@@ -136,6 +156,10 @@ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &co
+ 	if (it != context.ctrlMap.end() && cfg.vblankSupported) {
+ 		agc.minFrameDuration = std::chrono::microseconds(it->second.min().get<int64_t>());
+ 		agc.maxFrameDuration = std::chrono::microseconds(it->second.max().get<int64_t>());
++		if (defaultMaxFrameDuration_)
++			agc.maxFrameDuration = std::clamp(*defaultMaxFrameDuration_,
++							  agc.minFrameDuration,
++							  agc.maxFrameDuration);
+ 	} else {
+ 		agc.minFrameDuration = cfg.lineDuration * (cfg.frameHeight + cfg.vblankDef);
+ 		agc.maxFrameDuration = agc.minFrameDuration;
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 6e9ba728..ad732b1a 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -7,6 +7,10 @@
+ 
+ #pragma once
+ 
++#include <optional>
++
++#include <libcamera/base/utils.h>
++
+ #include "algorithm.h"
+ 
+ namespace libcamera {
+@@ -39,6 +43,7 @@ private:
+ 	int32_t exposureMaxForVblank(const IPAContext &context, int32_t vblank) const;
+ 
+ 	double maxDigitalGain_;
++	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+ 
+ } /* namespace ipa::softisp::algorithms */
+-- 
+2.53.0
+

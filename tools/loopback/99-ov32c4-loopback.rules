@@ -1,0 +1,4 @@
+# Po vzniku loopback uzla zafixuj format (keep_format=1 v set-caps):
+# uzol potom hlasi Video Capture aj bez pripojeneho writera a aplikacie
+# ho vidia v zozname kamier. YUYV 1280x720 @ 15 fps = co dava feeder.
+ACTION=="add", SUBSYSTEM=="video4linux", ATTR{name}=="Lenovo OV32C4", RUN+="/usr/bin/v4l2loopback-ctl set-caps %E{DEVNAME} YUYV:1280x720@15"

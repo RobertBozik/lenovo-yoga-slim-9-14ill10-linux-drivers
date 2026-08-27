@@ -1,0 +1,145 @@
+From 99012256b8aef8cba61161a1021926bbd0bdebb2 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Thu, 27 Aug 2026 11:10:41 +0000
+Subject: [PATCH] ipa: softisp: Meter the skin when there is some
+
+No percentile of the metered area finds the subject in every scene: a
+sky behind the subject fills the upper half of the centre and the
+percentile lands in the sky, a dark shirt filling the frame drags it
+the other way and blows the face out.
+
+With meteringSkinWeight, the zone means are white balanced and put
+through the colour matrix, zones with a skin-like chromaticity are
+averaged, and their luminance takes over the target in proportion to
+how much skin was found and to the weight. The highlight guard then
+protects the skin and lets the background clip. A beige wall or wood
+is far enough from skin in chromaticity after the matrix not to match.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/agc.cpp | 75 ++++++++++++++++++++++++++++++
+ src/ipa/softisp/algorithms/agc.h   |  1 +
+ 2 files changed, 76 insertions(+)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index a2e515b..7ddbbdc 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -20,6 +20,8 @@
+ 
+ #include "control_ids.h"
+ 
++#include "libcamera/internal/matrix.h"
++
+ namespace libcamera {
+ 
+ LOG_DEFINE_CATEGORY(IPASoftIspExposure)
+@@ -98,6 +100,23 @@ static constexpr unsigned int kMaxSettlePeriods = 2;
+ static constexpr double kHighlightHysteresis = 1.1;
+ static constexpr double kHighlightAim = 0.95;
+ 
++/*
++ * Skin metering (meteringSkinWeight): zones whose colour after the white
++ * balance and the colour matrix is skin-like are taken as the subject,
++ * and their mean luminance is aimed at the target, blended with the
++ * percentile metering by how much skin was found. The chromaticity of
++ * skin after the matrix, R/G and B/G, with the widths of the match.
++ */
++static constexpr double kSkinRG = 1.35;
++static constexpr double kSkinBG = 0.90;
++static constexpr double kSkinSigmaRG = 0.12;
++static constexpr double kSkinSigmaBG = 0.10;
++/* Fraction of the frame that has to be skin for full confidence */
++static constexpr double kSkinFullFraction = 0.04;
++static constexpr double kSkinMinFraction = 0.01;
++/* Skin is never pushed above this linear level by the highlight guard */
++static constexpr double kSkinHighlight = 0.55;
++
+ /*
+  * Digital gain is applied by the ISP on top of the sensor exposure and
+  * analogue gain, only when those are exhausted. It doesn't add information,
+@@ -139,6 +158,12 @@ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ 	meteringCentreWeight_ = tuningData["meteringCentreWeight"].get<double>(0.0);
+ 	meteringMedianTarget_ = tuningData["meteringMedianTarget"].get<double>(0.0);
+ 	meteringPercentile_ = tuningData["meteringPercentile"].get<double>(50.0);
++	meteringSkinWeight_ = tuningData["meteringSkinWeight"].get<double>(0.0);
++	if (meteringSkinWeight_ < 0.0 || meteringSkinWeight_ > 1.0) {
++		LOG(IPASoftIspExposure, Warning)
++			<< "meteringSkinWeight must be in [0, 1], ignored";
++		meteringSkinWeight_ = 0.0;
++	}
+ 	if (meteringPercentile_ <= 0.0 || meteringPercentile_ >= 100.0) {
+ 		LOG(IPASoftIspExposure, Warning)
+ 			<< "meteringPercentile must be in ]0, 100[, using 50";
+@@ -688,6 +713,56 @@ void Agc::process(IPAContext &context,
+ 		highlight = position / histogramSize * digitalGain / neutral;
+ 	}
+ 
++	/*
++	 * Skin metering: the subject is where the skin is. The zone means
++	 * are white balanced and put through the colour matrix, the skin-like
++	 * ones (by chromaticity) are averaged, and their luminance takes over
++	 * the target in proportion to how much skin was found. The highlight
++	 * guard then protects the skin, not the background.
++	 */
++	if (meteringSkinWeight_ > 0.0 && meteringMedianTarget_ > 0.0) {
++		const double scale = static_cast<double>(1u << stats->zoneShift);
++		const double black = context.activeState.blc.level * scale;
++		const Matrix<float, 3, 3> &ccm = context.activeState.combinedMatrix;
++		double skinY = 0.0, skinW = 0.0, total = 0.0;
++		for (const SwIspStats::Zone &zone : stats->zones) {
++			if (zone.count == 0)
++				continue;
++			total += zone.count;
++			const double r = std::max(zone.sumR / static_cast<double>(zone.count) - black, 0.0) * gains.r();
++			const double g = std::max(zone.sumG / static_cast<double>(zone.count) - black, 0.0) * gains.g();
++			const double b = std::max(zone.sumB / static_cast<double>(zone.count) - black, 0.0) * gains.b();
++			const double cr = ccm[0][0] * r + ccm[0][1] * g + ccm[0][2] * b;
++			const double cg = ccm[1][0] * r + ccm[1][1] * g + ccm[1][2] * b;
++			const double cb = ccm[2][0] * r + ccm[2][1] * g + ccm[2][2] * b;
++			if (cg <= 1.0)
++				continue;
++			const double drg = (cr / cg - kSkinRG) / kSkinSigmaRG;
++			const double dbg = (cb / cg - kSkinBG) / kSkinSigmaBG;
++			const double skin = std::exp(-(drg * drg + dbg * dbg));
++			const double y = (0.299 * r + 0.587 * g + 0.114 * b) / (256.0 * scale);
++			skinY += skin * zone.count * y;
++			skinW += skin * zone.count;
++		}
++
++		const double fraction = total > 0.0 ? skinW / total : 0.0;
++		if (fraction >= kSkinMinFraction) {
++			const double confidence = meteringSkinWeight_ *
++						  std::min(fraction / kSkinFullFraction, 1.0);
++			const double ySkin = skinY / skinW * digitalGain;
++			const float skinMSV = static_cast<float>(kExposureOptimal * ySkin / meteringMedianTarget_);
++			exposureMSV = confidence * skinMSV + (1.0 - confidence) * exposureMSV;
++			if (highlightLevel_ > 0.0) {
++				/* Express the skin level on the highlight scale */
++				const double skinHighlight = ySkin * highlightLevel_ / kSkinHighlight;
++				highlight = confidence * skinHighlight + (1.0 - confidence) * highlight;
++			}
++			LOG(IPASoftIspExposure, Debug)
++				<< "Skin fraction " << fraction << " luminance " << ySkin
++				<< " confidence " << confidence << " -> MSV " << exposureMSV;
++		}
++	}
++
+ 	updateExposure(context, frameContext, exposureMSV, highlight);
+ }
+ 
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 7731163..a48981c 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -51,6 +51,7 @@ private:
+ 	double meteringCentreWeight_;
+ 	double meteringMedianTarget_;
+ 	double meteringPercentile_;
++	double meteringSkinWeight_;
+ 	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+ 
+-- 
+2.43.0
+

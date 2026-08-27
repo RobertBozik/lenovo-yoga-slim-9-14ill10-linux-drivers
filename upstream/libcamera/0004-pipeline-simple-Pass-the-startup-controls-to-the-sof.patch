@@ -1,0 +1,128 @@
+From e9ed09ad19472577adfcb850e242e9fc6485c57e Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Tue, 25 Aug 2026 08:54:22 +0000
+Subject: [PATCH 4/7] pipeline: simple: Pass the startup controls to the
+ software ISP IPA
+
+The controls passed to Camera::start() were dropped by the simple
+pipeline handler, so applications that configure the camera at start,
+such as libcamerasrc with its framerate caps and the PipeWire libcamera
+source, had no effect on the software ISP: FrameDurationLimits, AWB
+mode or colour gains set that way were silently ignored.
+
+Extend the software ISP and its IPA start() with the control list, and
+have the IPA feed the controls through the algorithms' queueRequest()
+handlers with a throwaway frame context, so that they end up in the
+active state exactly as per-request controls do.
+
+Signed-off-by: Robert Bozik <robertbozik@gmail.com>
+---
+ .../libcamera/internal/software_isp/software_isp.h  |  2 +-
+ include/libcamera/ipa/softisp.mojom                 |  2 +-
+ src/ipa/softisp/softisp.cpp                         | 13 +++++++++++--
+ src/libcamera/pipeline/simple/simple.cpp            |  4 ++--
+ src/libcamera/software_isp/software_isp.cpp         |  5 +++--
+ 5 files changed, 18 insertions(+), 8 deletions(-)
+
+diff --git a/include/libcamera/internal/software_isp/software_isp.h b/include/libcamera/internal/software_isp/software_isp.h
+index da893d24..9f3227d5 100644
+--- a/include/libcamera/internal/software_isp/software_isp.h
++++ b/include/libcamera/internal/software_isp/software_isp.h
+@@ -73,7 +73,7 @@ public:
+ 	void processStats(const uint32_t frame, const uint32_t bufferId,
+ 			  const ControlList &sensorControls);
+ 
+-	int start();
++	int start(const ControlList &controls);
+ 	void stop();
+ 
+ 	void queueRequest(const uint32_t frame, const ControlList &controls);
+diff --git a/include/libcamera/ipa/softisp.mojom b/include/libcamera/ipa/softisp.mojom
+index a892d84f..d9c9842f 100644
+--- a/include/libcamera/ipa/softisp.mojom
++++ b/include/libcamera/ipa/softisp.mojom
+@@ -19,7 +19,7 @@ interface IPASoftIspInterface {
+ 	     libcamera.IPACameraSensorInfo sensorInfo,
+ 	     libcamera.ControlInfoMap sensorControls)
+ 		=> (int32 ret, libcamera.ControlInfoMap ipaControls, bool ccmEnabled);
+-	start() => (int32 ret);
++	start(libcamera.ControlList controls) => (int32 ret);
+ 	stop();
+ 	configure(IPAConfigInfo configInfo)
+ 		=> (int32 ret);
+diff --git a/src/ipa/softisp/softisp.cpp b/src/ipa/softisp/softisp.cpp
+index 612f9dfa..6d6b80d5 100644
+--- a/src/ipa/softisp/softisp.cpp
++++ b/src/ipa/softisp/softisp.cpp
+@@ -61,7 +61,7 @@ public:
+ 		 bool *ccmEnabled) override;
+ 	int configure(const IPAConfigInfo &configInfo) override;
+ 
+-	int start() override;
++	int start(const ControlList &controls) override;
+ 	void stop() override;
+ 
+ 	void queueRequest(const uint32_t frame, const ControlList &controls) override;
+@@ -301,8 +301,17 @@ int IPASoftIsp::configure(const IPAConfigInfo &configInfo)
+ 	return 0;
+ }
+ 
+-int IPASoftIsp::start()
++int IPASoftIsp::start(const ControlList &controls)
+ {
++	/*
++	 * Apply the startup controls through the algorithms, as if they had
++	 * been queued with a request. The frame context is a throwaway, the
++	 * algorithms record what matters in the active state.
++	 */
++	IPAFrameContext frameContext{};
++	for (const auto &algo : algorithms())
++		algo->queueRequest(context_, 0, frameContext, controls);
++
+ 	return 0;
+ }
+ 
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index 0a0cfc55..4793a522 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -1647,7 +1647,7 @@ int SimplePipelineHandler::exportFrameBuffers(Camera *camera, Stream *stream,
+ 		return data->video_->exportBuffers(count, buffers);
+ }
+ 
+-int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlList *controls)
++int SimplePipelineHandler::start(Camera *camera, const ControlList *controls)
+ {
+ 	SimpleCameraData *data = cameraData(camera);
+ 	V4L2VideoDevice *video = data->video_;
+@@ -1705,7 +1705,7 @@ int SimplePipelineHandler::start(Camera *camera, [[maybe_unused]] const ControlL
+ 		if (data->converter_)
+ 			ret = data->converter_->start();
+ 		else if (data->swIsp_)
+-			ret = data->swIsp_->start();
++			ret = data->swIsp_->start(controls ? *controls : ControlList());
+ 		else
+ 			ret = 0;
+ 
+diff --git a/src/libcamera/software_isp/software_isp.cpp b/src/libcamera/software_isp/software_isp.cpp
+index ae86c20a..432cab24 100644
+--- a/src/libcamera/software_isp/software_isp.cpp
++++ b/src/libcamera/software_isp/software_isp.cpp
+@@ -374,11 +374,12 @@ int SoftwareIsp::queueBuffers(uint32_t frame, FrameBuffer *input,
+ 
+ /**
+  * \brief Starts the Software ISP streaming operation
++ * \param[in] controls The controls to apply before the first frame
+  * \return 0 on success, any other value indicates an error
+  */
+-int SoftwareIsp::start()
++int SoftwareIsp::start(const ControlList &controls)
+ {
+-	int ret = ipa_->start();
++	int ret = ipa_->start(controls);
+ 	if (ret)
+ 		return ret;
+ 
+-- 
+2.53.0
+

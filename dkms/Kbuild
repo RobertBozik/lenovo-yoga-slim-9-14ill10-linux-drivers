@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: GPL-2.0
+obj-m := ov32c4.o ipu-bridge.o

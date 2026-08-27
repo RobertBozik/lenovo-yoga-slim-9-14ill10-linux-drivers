@@ -1,0 +1,104 @@
+From 009915c3b23f3f9a5ec207ed87c1a32b36856cb8 Mon Sep 17 00:00:00 2001
+From: Robert Bozik <robertbozik@gmail.com>
+Date: Thu, 27 Aug 2026 09:08:30 +0000
+Subject: [PATCH] ipa: softisp: Meter the median instead of the mean
+
+The mean sample value follows every bright patch in the metered area,
+because the bins are linear: a strip of window blinds behind a face is
+enough to hold the face in the dark, even with the metering weighted to
+the centre.
+
+Let the tuning file set meteringMedianTarget: the median of the metered
+pixels, which is the bulk of the subject, is aimed at that normalised
+linear level instead. It is expressed as the equivalent mean sample
+value so that the update logic, including the settling and the
+highlight protection, is shared. The default of 0 keeps the mean.
+
+Assisted-by: Claude:claude-fable-5 [Claude Code]
+---
+ src/ipa/softisp/algorithms/agc.cpp | 42 +++++++++++++++++++++++++++---
+ src/ipa/softisp/algorithms/agc.h   |  1 +
+ 2 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/src/ipa/softisp/algorithms/agc.cpp b/src/ipa/softisp/algorithms/agc.cpp
+index 247933f..39b0684 100644
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -137,6 +137,12 @@ int Agc::init(IPAContext &context, const ValueNode &tuningData)
+ 	startGain_ = tuningData["startGain"].get<double>();
+ 	highlightPercentile_ = tuningData["highlightPercentile"].get<double>(kDefaultHighlightPercentile);
+ 	meteringCentreWeight_ = tuningData["meteringCentreWeight"].get<double>(0.0);
++	meteringMedianTarget_ = tuningData["meteringMedianTarget"].get<double>(0.0);
++	if (meteringMedianTarget_ < 0.0 || meteringMedianTarget_ >= 1.0) {
++		LOG(IPASoftIspExposure, Warning)
++			<< "meteringMedianTarget must be in [0, 1[, ignored";
++		meteringMedianTarget_ = 0.0;
++	}
+ 	if (meteringCentreWeight_ < 0.0 || meteringCentreWeight_ > 1.0) {
+ 		LOG(IPASoftIspExposure, Warning)
+ 			<< "meteringCentreWeight must be in [0, 1], ignored";
+@@ -609,6 +615,38 @@ void Agc::process(IPAContext &context,
+ 
+ 	float exposureMSV = (denom <= 0.0 ? 0 : static_cast<float>(num / denom));
+ 
++	const RGB<double> &gains = frameContext.awb.gains;
++	const double neutral = 0.299 / std::max(gains.r(), 1e-3) +
++			       0.587 / std::max(gains.g(), 1e-3) +
++			       0.114 / std::max(gains.b(), 1e-3);
++
++	/*
++	 * Median metering (meteringMedianTarget): the mean sample value
++	 * follows every bright patch, as the bins are linear. Aim the median
++	 * of the metered pixels, the bulk of the subject, at the target
++	 * (normalised linear, after the digital and white balance gains)
++	 * instead, and express it as the equivalent MSV so that the update
++	 * logic is shared: the ratio target / median is then the jump the
++	 * update computes from the optimal MSV.
++	 */
++	if (meteringMedianTarget_ > 0.0 && denom > 0.0) {
++		double seen = 0.0;
++		double position = 0.0;
++		for (unsigned int i = 0; i < histogramSize; i++) {
++			if (seen + histogram[i] >= 0.5) {
++				position = i + (0.5 - seen) / std::max(histogram[i], 1e-9);
++				break;
++			}
++			seen += histogram[i];
++		}
++		const double median = std::max(position, 0.5) / histogramSize *
++				      digitalGain / neutral;
++		exposureMSV = static_cast<float>(kExposureOptimal * median / meteringMedianTarget_);
++		LOG(IPASoftIspExposure, Debug)
++			<< "Median " << median << " target " << meteringMedianTarget_
++			<< " -> equivalent MSV " << exposureMSV;
++	}
++
+ 	/*
+ 	 * Luminance of the highlightPercentile of the pixels as the ISP
+ 	 * outputs it, in normalised linear units: the histogram bin above
+@@ -638,10 +676,6 @@ void Agc::process(IPAContext &context,
+ 			seen += count;
+ 		}
+ 
+-		const RGB<double> &gains = frameContext.awb.gains;
+-		double neutral = 0.299 / std::max(gains.r(), 1e-3) +
+-				 0.587 / std::max(gains.g(), 1e-3) +
+-				 0.114 / std::max(gains.b(), 1e-3);
+ 		highlight = position / histogramSize * digitalGain / neutral;
+ 	}
+ 
+diff --git a/src/ipa/softisp/algorithms/agc.h b/src/ipa/softisp/algorithms/agc.h
+index 724db7d..ae6708b 100644
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -49,6 +49,7 @@ private:
+ 	std::optional<double> startGain_;
+ 	double highlightPercentile_;
+ 	double meteringCentreWeight_;
++	double meteringMedianTarget_;
+ 	std::optional<utils::Duration> defaultMaxFrameDuration_;
+ };
+ 
+-- 
+2.43.0
+
