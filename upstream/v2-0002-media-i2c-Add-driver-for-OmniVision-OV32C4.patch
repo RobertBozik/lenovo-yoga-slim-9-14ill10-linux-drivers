@@ -1,7 +1,7 @@
-From 99d552344281272563ea9ccf83d56563b4a5e3bb Mon Sep 17 00:00:00 2001
+From f76edb1635be6cfdd678f3d38e49127412c097a6 Mon Sep 17 00:00:00 2001
 From: Robert Bozik <robertbozik@gmail.com>
 Date: Mon, 24 Aug 2026 11:58:39 +0000
-Subject: [PATCH 2/3] media: i2c: Add driver for OmniVision OV32C4
+Subject: [PATCH v2 2/3] media: i2c: Add driver for OmniVision OV32C4
 
 The OV32C4 is a 32 megapixel RGBC CMOS image sensor with on-chip 4-cell
 fusion and binning, connected over 4 MIPI CSI-2 D-PHY lanes. It is used
@@ -41,10 +41,28 @@ OmniVision drivers already in tree, because they turned out to differ:
    window by one pixel to undo a Bayer shift on the same registers;
    doing that here introduces one instead of removing it.
 
-Signed-off-by: Robert Bozik <robertbozik@gmail.com>
 Assisted-by: Claude:claude-opus-5 sparse
 Assisted-by: Claude:claude-fable-5 sparse
+Signed-off-by: Robert Bozik <robertbozik@gmail.com>
 ---
+Changes in v2:
+- Use pm_ptr() instead of pm_sleep_ptr() for dev_pm_ops.
+  DEFINE_RUNTIME_DEV_PM_OPS also fills in the runtime callbacks, and
+  pm_sleep_ptr() is gated on CONFIG_PM_SLEEP, so with CONFIG_PM=y and
+  CONFIG_PM_SLEEP=n .pm would be NULL and the sensor would never be
+  powered down after probe. ov13b10, ov08d10 and ov2735 use pm_ptr()
+  here; ov02c10, which this driver was modelled on, does not.
+- Free the embedded control handler on the probe error path.
+  sd.ctrl_handler is only assigned at the end of probe, so an error out
+  of ov32c4_init_controls() reached v4l2_ctrl_handler_free(NULL); the
+  label now frees &ov32c4->ctrl_handler, which is the same pointer once
+  probe has succeeded.
+- Signed-off-by placed last in the trailer block (Krzysztof Kozlowski).
+
+Both fixes were reported by the Sashiko review bot on v1. Neither
+changes behaviour on the machine this was tested on (CONFIG_PM_SLEEP=y,
+and the second is an error path), but both are real.
+
  MAINTAINERS                |    8 +
  drivers/media/i2c/Kconfig  |   11 +
  drivers/media/i2c/Makefile |    1 +
@@ -107,7 +125,7 @@ index d04bd5724..79bf2e393 100644
  obj-$(CONFIG_VIDEO_OV5645) += ov5645.o
 diff --git a/drivers/media/i2c/ov32c4.c b/drivers/media/i2c/ov32c4.c
 new file mode 100644
-index 000000000..4039aa85c
+index 000000000..8d11e1b00
 --- /dev/null
 +++ b/drivers/media/i2c/ov32c4.c
 @@ -0,0 +1,2839 @@
@@ -2911,7 +2929,7 @@ index 000000000..4039aa85c
 +	media_entity_cleanup(&ov32c4->sd.entity);
 +
 +probe_error_v4l2_ctrl_handler_free:
-+	v4l2_ctrl_handler_free(ov32c4->sd.ctrl_handler);
++	v4l2_ctrl_handler_free(&ov32c4->ctrl_handler);
 +
 +probe_error_power_off:
 +	ov32c4_power_off(ov32c4->dev);
@@ -2939,7 +2957,7 @@ index 000000000..4039aa85c
 +static struct i2c_driver ov32c4_i2c_driver = {
 +	.driver = {
 +		.name = "ov32c4",
-+		.pm = pm_sleep_ptr(&ov32c4_pm_ops),
++		.pm = pm_ptr(&ov32c4_pm_ops),
 +		.acpi_match_table = ACPI_PTR(ov32c4_acpi_ids),
 +		.of_match_table = ov32c4_of_match,
 +	},
