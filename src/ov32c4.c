@@ -2,31 +2,12 @@
 /*
  * OmniVision OV32C4 image sensor driver.
  *
- * Built for the Lenovo Yoga Slim 9 14ILL10 (83CX, Intel Lunar Lake / IPU7),
- * where the sensor sits on i2c-0 at 0x36 behind ACPI _HID "OVTI32C4" and an
- * INT3472 discrete control logic node providing "avdd" and "reset".
- *
- * Structure follows drivers/media/i2c/ov02c10.c (v4l2-cci + regmap,
- * .enable_streams/.disable_streams, v4l2_subdev_state).
- *
- * Provenance of the numbers in this file:
- *
- *  - the mode register table below is the verbatim init sequence of mode
- *    "c09" from the Windows driver ov32c4.sys (file offset 0x00031300,
- *    1787 entries, strictly ascending, 16-byte stride, ends cleanly at
- *    0x7150). It is reproduced 1:1, nothing added or reordered.
- *  - chip id: 3-byte read at 0x300a, expected 0x563243 -- read straight out
- *    of ov32c4.sys (identify routine at 0x14000a454).
- *  - exposure 0x3500 (24 bit) + second context 0x3540, gain 0x3508 (16 bit)
- *    + second context 0x3548, VTS 0x380e, and the rule
- *    exposure_max = VTS - 32 -- from ov32c4.sys (0x14000bee0).
- *  - HTS/VTS/window: registers of the same table (HTS 1224, VTS 2614,
- *    3264x1840 out of a 6560x3712 window, 2x2 binning).
- *
- * The link frequency is 400 MHz (800 Mbps per lane). ov32c4.sys carries it
- * as MipiBps -- bits per second, not hertz -- and it is confirmed on the
- * machine: the IPU7 D-PHY locks and the sensor streams at a measured
- * 30.00 fps, which matches pixel_rate / (ppl * vts) exactly.
+ * The sensor ships in laptops with an Intel IPU7, where it is enumerated
+ * through ACPI _HID "OVTI32C4". There is no public datasheet; the 400 MHz
+ * link frequency comes from the vendor driver, which carries it as bits per
+ * second, and is confirmed on hardware: the receiver locks and the sensor
+ * streams 3264x1840 at a measured 30.00 fps, which is pixel_rate divided by
+ * ppl times vts.
  */
 
 #include <linux/acpi.h>
@@ -49,33 +30,14 @@
 #define OV32C4_RGB_DEPTH		10
 #define OV32C4_DATA_LANES		4
 
-/*
- * Internal sensor clock the timing registers are counted in.
- * 96 MHz = 5 * MCLK; derived as HTS_REG * VTS * fps = 1224 * 2614 * 30.
- */
-#define OV32C4_SCLK			96000000ULL
-
-/* Line length as the sensor counts it, in SCLK cycles (register 0x380c). */
-#define OV32C4_HTS_REG			1224
+/* Horizontal timing */
+#define OV32C4_REG_HTS			CCI_REG16(0x380c)
 
 /*
- * Pixel array geometry, all of it derived from the mode registers rather than
- * assumed.
- *
- * 0x3800..0x3807 place the readout window at x 0..6559, y 608..4319, so the
- * full array is 6560 x 4928. The product brief gives the active area as
- * 6528 x 4896, which is 32 columns and 32 rows less -- 16 blind ones on each
- * side, hence the (16, 16) origin.
- *
- * The mode reads that window with 2x2 binning into 3280 x 1856 and then takes
- * 3264 x 1840 out of it at offset (8, 9) (0x3810..0x3813). Mapping that back
- * to array coordinates:
- *
- *   columns:  binned 8..3271  ->  16 .. 6543   = 6528 wide
- *   rows:     binned 9..1848  ->  626 .. 4305  = 3680 high
- *
- * The horizontal crop therefore lands exactly on the active width: the mode
- * reads the blind columns and throws them away again.
+ * Pixel array geometry, derived from the mode registers: 0x3800..0x3807 read
+ * a 6560x3712 window out of a 6560x4928 array, 2x2 binned to 3280x1856, of
+ * which 0x3810..0x3813 take 3264x1840 at offset (8, 9). The 32 columns and
+ * rows by which the array exceeds the 6528x4896 active area are blind.
  */
 #define OV32C4_NATIVE_WIDTH		6560U
 #define OV32C4_NATIVE_HEIGHT		4928U
@@ -94,20 +56,11 @@
 #define OV32C4_REG_STREAM_CONTROL	CCI_REG8(0x0100)
 
 /*
- * The module carries a companion chip on the second I2C address of the
- * sensor's ACPI _CRS (0x3e on this machine). The sensor does not answer I2C
- * at all until this register is written: ov32c4.sys issues exactly this write
- * to _CRS resource index 1 both before reading the chip id and before every
- * mode set, and there is no matching "off" write anywhere in the binary.
- * Confirmed on the machine: without it 0x36 NACKs everything, with it
- * 0x300a reads back 0x563243 straight away.
- *
- * ACPI declares that address as the VCM (ipu_bridge tries to instantiate a
- * VCM client on it), so the chip is most likely a VCM driver with an
- * integrated LDO and this register switches the sensor's core rail. The
- * write is therefore issued as a plain i2c_transfer and the address is
- * deliberately NOT claimed with i2c_new_dummy_device() -- claiming it makes
- * ipu_bridge fail with -EBUSY and the VCM driver never binds.
+ * The sensor does not answer on I2C at all until this register is written in
+ * a companion chip, which the ACPI _CRS of the sensor lists as its second
+ * I2cSerialBus resource. The write is issued as a plain i2c_transfer and the
+ * address is deliberately not claimed with i2c_new_dummy_device(), so that
+ * the driver the platform assigns to that address can still bind.
  */
 #define OV32C4_COMPANION_ENABLE_REG	0x1001
 #define OV32C4_COMPANION_ENABLE_VAL	0x04
@@ -125,33 +78,15 @@
 #define OV32C4_EXPOSURE_MAX_MARGIN	32
 
 /*
- * Analogue gain. The register address and width come from ov32c4.sys; the
- * range was measured on the sensor, because the vendor driver clamps gain
- * one layer up and carries no limits of its own.
- *
- * Response is exactly proportional to the register value from 0x100 to
- * 0x7c0, so 0x100 is unity gain and 0x7c0 is 7.75x. That is also the value
- * the chip powers up with. Below 0x100 the output no longer tracks what was
- * written at all - 0xe0 and 0xff give the same result - and above 0x7c0 it
- * stops increasing, so neither region is exposed.
- *
- * Note for anyone copying from ov13b10, which uses the same register: there
- * unity is 0x80. That does not hold for this sensor.
- */
-/*
- * Mirror and flip. Bit 2 in each, but with opposite polarity: the mode table
- * leaves 0x3821 with the bit set and 0x3820 with it clear, and that is the
- * un-flipped state.
- *
- * Measured on the sensor: flipping either way leaves the Bayer
- * order alone, so nothing else has to change. Do not copy the window-offset
- * compensation ov13b10 does for the same registers - here it does not undo a
- * Bayer shift, it introduces one.
+ * Mirror and flip: bit 2 in each register, but with opposite polarity. The
+ * mode table leaves 0x3821 set and 0x3820 clear, and that is the un-flipped
+ * state. Neither changes the Bayer order.
  */
 #define OV32C4_REG_FLIP			CCI_REG8(0x3820)
 #define OV32C4_REG_MIRROR		CCI_REG8(0x3821)
 #define OV32C4_FLIP_BIT			BIT(2)
 
+/* Analogue gain: 0x100 is unity and 0x7c0, 7.75x, is the maximum. */
 #define OV32C4_REG_ANALOG_GAIN		CCI_REG16(0x3508)
 #define OV32C4_REG_ANALOG_GAIN_CTX2	CCI_REG16(0x3548)
 #define OV32C4_ANA_GAIN_MIN		0x100
@@ -160,16 +95,8 @@
 #define OV32C4_ANA_GAIN_DEFAULT		0x100
 
 /*
- * Digital gain, 24 bit at 0x350a with a second context at 0x354a. The vendor
- * driver writes it as the internal value shifted left by 6 (ov32c4.sys
- * 0x14000bfd7) and reads it back shifted right by 6, so the control here
- * carries the internal value and the driver does the shift.
- *
- * Measured on the sensor: 1024 is unity and the response is
- * proportional - writing 2048, 4096 and 8192 gives 1.99x, 3.86x and 7.62x,
- * the shortfall at the top being sensor clipping, not non-linearity. 16384
- * is outside the field and produces a black frame, so the range stops one
- * step below it.
+ * Digital gain. The register holds the gain shifted left by 6; the control
+ * carries the value itself, of which 1024 is unity.
  */
 #define OV32C4_REG_DIGITAL_GAIN		CCI_REG24(0x350a)
 #define OV32C4_REG_DIGITAL_GAIN_CTX2	CCI_REG24(0x354a)
@@ -182,9 +109,13 @@
 struct ov32c4_mode {
 	u32 width;
 	u32 height;
-	/* Line length as written to 0x380c, in sensor clock cycles */
-	u32 hts_reg;
-	/* Frame length as written to 0x380e, in lines */
+	/*
+	 * Line length in pixels, in the units of the PIXEL_RATE control.
+	 * OV32C4_REG_HTS holds the same line in the sensor's own clock
+	 * units, which for this mode is 1224 against these 4080 pixels.
+	 */
+	u32 ppl;
+	/* Frame length in lines, as written to OV32C4_REG_VTS */
 	u32 vts_min;
 
 	const struct reg_sequence *reg_sequence;
@@ -192,32 +123,16 @@ struct ov32c4_mode {
 };
 
 static const char * const ov32c4_supply_names[] = {
-	"avdd",		/* Analog power; the only one INT3472 provides here */
+	"avdd",		/* Analog power */
 };
 
-/*
- * Power-up timings. There is no public datasheet for this sensor, so these
- * are values that proved reliable during bring-up, not datasheet minima.
- */
+/* Power-up timings; there is no public datasheet for this sensor. */
 #define OV32C4_AVDD_SETTLE_US		5000
 #define OV32C4_RESET_SETTLE_US		20000
 
-/* Chip id read attempts, 20 ms apart, before giving up. */
-#define OV32C4_ID_RETRIES		5
-
 /*
- * Mode 3264x1840 @ 30 fps, 4 lanes, SGRBG10.
- *
- * Verbatim from ov32c4.sys, table "c09" at file offset 0x00031300:
- * 1787 register writes, addresses 0x0100..0x7150, strictly ascending.
- * Relevant values inside: window 0..6559 x 608..4319 (6560x3712),
- * output 3264x1840 (0x3808/0x380a), HTS 1224 (0x380c), VTS 2614 (0x380e),
- * 2x2 binning, PLL 0x0301=0xc8 0x0303=0x04 0x0304/05=0x0271 0x0316=0x3c,
- * MIPI global timing 0x4837=0x10.
- *
- * The 15 fps variant of the same table ("c10") differs only in VTS
- * (5228 = 2 x 2614), which is why it is not carried as a separate mode --
- * V4L2_CID_VBLANK covers it.
+ * Mode 3264x1840 @ 30 fps, 4 lanes, SGRBG10. The 15 fps variant of the same
+ * table differs only in VTS, which V4L2_CID_VBLANK covers.
  */
 static const struct reg_sequence ov32c4_mode_3264x1840_regs[] = {
 	{ 0x0100, 0x00 },
@@ -2017,7 +1932,7 @@ static const struct ov32c4_mode supported_modes[] = {
 	{
 		.width = 3264,
 		.height = 1840,
-		.hts_reg = OV32C4_HTS_REG,
+		.ppl = 4080,
 		.vts_min = 2614,
 		.reg_sequence = ov32c4_mode_3264x1840_regs,
 		.sequence_length = ARRAY_SIZE(ov32c4_mode_3264x1840_regs),
@@ -2103,19 +2018,6 @@ static u64 ov32c4_pixel_rate(struct ov32c4 *ov32c4)
 		       2 * ov32c4->mipi_lanes, OV32C4_RGB_DEPTH);
 }
 
-/*
- * 0x380c/0x380d is the line length in sensor clock cycles, not in pixels on
- * the bus. What V4L2 wants (width + hblank) is that length expressed in bus
- * pixels, so scale it by pixel_rate / SCLK. Proof that this is the right
- * relation, and not a fixed "HTS is in units of N pixels": ov13b10 has the
- * same register value 1176 in its 4-lane and 2-lane tables but reports
- * ppl 4704 and 2352 respectively.
- */
-static u32 ov32c4_ppl(struct ov32c4 *ov32c4, const struct ov32c4_mode *mode)
-{
-	return div_u64(mode->hts_reg * ov32c4_pixel_rate(ov32c4), OV32C4_SCLK);
-}
-
 static int ov32c4_set_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct ov32c4 *ov32c4 = container_of(ctrl->handler,
@@ -2126,13 +2028,16 @@ static int ov32c4_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		exposure_max = height + ctrl->val - OV32C4_EXPOSURE_MAX_MARGIN;
-		__v4l2_ctrl_modify_range(ov32c4->exposure,
-					 ov32c4->exposure->minimum,
-					 exposure_max, ov32c4->exposure->step,
-					 exposure_max);
+		ret = __v4l2_ctrl_modify_range(ov32c4->exposure,
+					       ov32c4->exposure->minimum,
+					       exposure_max,
+					       ov32c4->exposure->step,
+					       exposure_max);
+		if (ret)
+			return ret;
 	}
 
-	if (!pm_runtime_get_if_in_use(ov32c4->dev))
+	if (!pm_runtime_get_if_active(ov32c4->dev))
 		return 0;
 
 	switch (ctrl->id) {
@@ -2197,6 +2102,10 @@ static int ov32c4_init_controls(struct ov32c4 *ov32c4)
 	s64 exposure_max, h_blank, pixel_rate;
 	int ret;
 
+	ret = v4l2_fwnode_device_parse(ov32c4->dev, &props);
+	if (ret)
+		return ret;
+
 	v4l2_ctrl_handler_init(ctrl_hdlr, 13);
 
 	ov32c4->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, &ov32c4_ctrl_ops,
@@ -2204,8 +2113,6 @@ static int ov32c4_init_controls(struct ov32c4 *ov32c4)
 						   ARRAY_SIZE(link_freq_menu_items) - 1,
 						   ov32c4->link_freq_index,
 						   link_freq_menu_items);
-	if (ov32c4->link_freq)
-		ov32c4->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	pixel_rate = ov32c4_pixel_rate(ov32c4);
 	ov32c4->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &ov32c4_ctrl_ops,
@@ -2219,12 +2126,10 @@ static int ov32c4_init_controls(struct ov32c4 *ov32c4)
 					   V4L2_CID_VBLANK, vblank_min,
 					   vblank_max, 1, vblank_default);
 
-	h_blank = ov32c4_ppl(ov32c4, mode) - mode->width;
+	h_blank = mode->ppl - mode->width;
 	ov32c4->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &ov32c4_ctrl_ops,
 					   V4L2_CID_HBLANK, h_blank, h_blank,
 					   1, h_blank);
-	if (ov32c4->hblank)
-		ov32c4->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	v4l2_ctrl_new_std(ctrl_hdlr, &ov32c4_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 			  OV32C4_ANA_GAIN_MIN, OV32C4_ANA_GAIN_MAX,
@@ -2246,14 +2151,13 @@ static int ov32c4_init_controls(struct ov32c4 *ov32c4)
 	v4l2_ctrl_new_std(ctrl_hdlr, &ov32c4_ctrl_ops, V4L2_CID_VFLIP,
 			  0, 1, 1, 0);
 
-	ret = v4l2_fwnode_device_parse(ov32c4->dev, &props);
-	if (ret)
-		return ret;
-
 	v4l2_ctrl_new_fwnode_properties(ctrl_hdlr, &ov32c4_ctrl_ops, &props);
 
 	if (ctrl_hdlr->error)
 		return ctrl_hdlr->error;
+
+	ov32c4->link_freq->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	ov32c4->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 
 	ov32c4->sd.ctrl_handler = ctrl_hdlr;
 
@@ -2265,7 +2169,6 @@ static void ov32c4_update_pad_format(const struct ov32c4_mode *mode,
 {
 	fmt->width = mode->width;
 	fmt->height = mode->height;
-	/* graph_settings_OV32C4_*_LNL.bin advertise this mode as GR10 */
 	fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
 	fmt->field = V4L2_FIELD_NONE;
 }
@@ -2306,29 +2209,26 @@ static int ov32c4_disable_streams(struct v4l2_subdev *sd,
 				  u32 pad, u64 streams_mask)
 {
 	struct ov32c4 *ov32c4 = to_ov32c4(sd);
+	int ret;
 
-	cci_write(ov32c4->regmap, OV32C4_REG_STREAM_CONTROL, 0, NULL);
+	ret = cci_write(ov32c4->regmap, OV32C4_REG_STREAM_CONTROL, 0, NULL);
 	pm_runtime_put(ov32c4->dev);
 
-	return 0;
+	return ret;
 }
 
 static int ov32c4_get_pm_resources(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct ov32c4 *ov32c4 = to_ov32c4(sd);
-	int i;
 
-	/*
-	 * INT3472 registers the reset pin as GPIO_ACTIVE_LOW, so a logical
-	 * 1 here means "held in reset".
-	 */
+	/* The reset pin is active low, so a logical 1 means "held in reset". */
 	ov32c4->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(ov32c4->reset))
 		return dev_err_probe(dev, PTR_ERR(ov32c4->reset),
 				     "failed to get reset gpio\n");
 
-	for (i = 0; i < ARRAY_SIZE(ov32c4_supply_names); i++)
+	for (unsigned int i = 0; i < ARRAY_SIZE(ov32c4_supply_names); i++)
 		ov32c4->supplies[i].supply = ov32c4_supply_names[i];
 
 	return devm_regulator_bulk_get(dev, ARRAY_SIZE(ov32c4_supply_names),
@@ -2336,8 +2236,8 @@ static int ov32c4_get_pm_resources(struct device *dev)
 }
 
 /*
- * Ungate the sensor through the companion chip. Deliberately a bare
- * i2c_transfer: the address belongs to the VCM and must stay free for it.
+ * Ungate the sensor through the companion chip, see
+ * OV32C4_COMPANION_ENABLE_REG.
  */
 static int ov32c4_companion_enable(struct ov32c4 *ov32c4)
 {
@@ -2410,12 +2310,6 @@ static int ov32c4_power_on(struct device *dev)
 		fsleep(1000);
 	}
 
-	dev_dbg(dev,
-		"powered: clk %lu Hz (enabled), avdd on, reset logical %d%s\n",
-		 clk_get_rate(ov32c4->img_clk),
-		 ov32c4->reset ? gpiod_get_value_cansleep(ov32c4->reset) : -1,
-		 ov32c4->reset ? "" : " (no reset gpio!)");
-
 	return 0;
 }
 
@@ -2426,6 +2320,7 @@ static int ov32c4_set_format(struct v4l2_subdev *sd,
 	const struct ov32c4_mode *mode = &supported_modes[0];
 	struct ov32c4 *ov32c4 = to_ov32c4(sd);
 	s32 vblank_def, h_blank;
+	int ret;
 
 	ov32c4_update_pad_format(mode, &fmt->format);
 	*v4l2_subdev_state_get_format(sd_state, fmt->pad) = fmt->format;
@@ -2434,14 +2329,20 @@ static int ov32c4_set_format(struct v4l2_subdev *sd,
 		return 0;
 
 	vblank_def = mode->vts_min - mode->height;
-	__v4l2_ctrl_modify_range(ov32c4->vblank, vblank_def,
-				 OV32C4_VTS_MAX - mode->height, 1, vblank_def);
-	__v4l2_ctrl_s_ctrl(ov32c4->vblank, vblank_def);
+	ret = __v4l2_ctrl_modify_range(ov32c4->vblank, vblank_def,
+				       OV32C4_VTS_MAX - mode->height, 1,
+				       vblank_def);
+	if (ret)
+		return ret;
 
-	h_blank = ov32c4_ppl(ov32c4, mode) - mode->width;
-	__v4l2_ctrl_modify_range(ov32c4->hblank, h_blank, h_blank, 1, h_blank);
+	ret = __v4l2_ctrl_s_ctrl(ov32c4->vblank, vblank_def);
+	if (ret)
+		return ret;
 
-	return 0;
+	h_blank = mode->ppl - mode->width;
+
+	return __v4l2_ctrl_modify_range(ov32c4->hblank, h_blank, h_blank, 1,
+					h_blank);
 }
 
 static int ov32c4_enum_mbus_code(struct v4l2_subdev *sd,
@@ -2487,53 +2388,6 @@ static const struct v4l2_subdev_video_ops ov32c4_video_ops = {
 	.s_stream = v4l2_subdev_s_stream_helper,
 };
 
-/* CSI-2 data type of the image stream: RAW10. */
-#define OV32C4_CSI2_DT_RAW10	0x2b
-
-/*
- * Tell the receiver which CSI-2 data types actually come down the link.
- *
- * IPU7 asks for this (ipu7_isys_setup_video, "Framedesc: stream %u, len %u,
- * vc %u, dt %#x"). Without the op the call returns -ENOIOCTLCMD, the receiver
- * derives a single data type from the media bus code and ends up configured
- * with one input pin at dt 0x2b -- which is why it reports one oversized
- * packet per frame.
- *
- * The sensor also emits one extra long packet per frame that the receiver
- * reports as oversized. It is deliberately not described here: its data type
- * could not be determined, and IPU7 has no metadata capture to route it to
- * anyway.
- */
-static int ov32c4_get_frame_desc(struct v4l2_subdev *sd, unsigned int pad,
-				 struct v4l2_mbus_frame_desc *fd)
-{
-	struct v4l2_mbus_frame_desc_entry *e;
-
-	if (pad != 0)
-		return -EINVAL;
-
-	memset(fd, 0, sizeof(*fd));
-	fd->type = V4L2_MBUS_FRAME_DESC_TYPE_CSI2;
-
-	e = &fd->entry[fd->num_entries++];
-	e->stream = 0;
-	e->pixelcode = MEDIA_BUS_FMT_SGRBG10_1X10;
-	e->bus.csi2.vc = 0;
-	e->bus.csi2.dt = OV32C4_CSI2_DT_RAW10;
-
-	return 0;
-}
-
-/*
- * libcamera asks for these and says so plainly when they are missing:
- *
- *   'ov32c4 0-0036': Failed to retrieve the sensor crop rectangle
- *   'ov32c4 0-0036': The sensor kernel driver needs to be fixed
- *
- * Without them it defaults PixelArraySize to the output size (3264x1840),
- * which is wrong by nearly a factor of four in area and makes every
- * field-of-view and pixel-pitch calculation on top of it wrong too.
- */
 static int ov32c4_get_selection(struct v4l2_subdev *sd,
 				struct v4l2_subdev_state *state,
 				struct v4l2_subdev_selection *sel)
@@ -2572,7 +2426,6 @@ static const struct v4l2_subdev_pad_ops ov32c4_pad_ops = {
 	.get_selection = ov32c4_get_selection,
 	.enum_mbus_code = ov32c4_enum_mbus_code,
 	.enum_frame_size = ov32c4_enum_frame_size,
-	.get_frame_desc = ov32c4_get_frame_desc,
 	.enable_streams = ov32c4_enable_streams,
 	.disable_streams = ov32c4_disable_streams,
 };
@@ -2592,29 +2445,13 @@ static const struct v4l2_subdev_internal_ops ov32c4_internal_ops = {
 
 static int ov32c4_identify_module(struct ov32c4 *ov32c4)
 {
-	struct i2c_client *client = to_i2c_client(ov32c4->dev);
-	unsigned int try;
 	u64 chip_id;
-	int ret = -ENODEV;
+	int ret;
 
-	/*
-	 * The sensor does not answer right after reset is released, so allow
-	 * a few attempts before declaring it absent.
-	 */
-	for (try = 0; try < OV32C4_ID_RETRIES; try++) {
-		if (try)
-			fsleep(20000);
-
-		ret = cci_read(ov32c4->regmap, OV32C4_REG_CHIP_ID, &chip_id,
-			       NULL);
-		if (!ret)
-			break;
-	}
-
+	ret = cci_read(ov32c4->regmap, OV32C4_REG_CHIP_ID, &chip_id, NULL);
 	if (ret)
 		return dev_err_probe(ov32c4->dev, ret,
-				     "no answer at i2c addr 0x%02x after %u tries\n",
-				     client->addr, try);
+				     "failed to read the chip id\n");
 
 	if (chip_id != OV32C4_CHIP_ID)
 		return dev_err_probe(ov32c4->dev, -ENXIO,
@@ -2634,11 +2471,19 @@ static int ov32c4_check_hwcfg(struct ov32c4 *ov32c4)
 	unsigned long link_freq_bitmap;
 	int ret;
 
-	/* The fwnode graph is built by ipu-bridge; wait for it. */
 	ep = fwnode_graph_get_endpoint_by_id(fwnode, 0, 0, 0);
+	/* NOT-UPSTREAM begin */
+	/*
+	 * Kernels up to 7.0 return -EINVAL from the parse below when the
+	 * endpoint does not exist yet, and the probe is then never retried;
+	 * the graph is built by ipu-bridge, which is still loading at this
+	 * point. Newer kernels return -EPROBE_DEFER there themselves, so this
+	 * is dropped from the patches sent upstream by scripts/to-upstream.sh.
+	 */
 	if (!ep)
 		return dev_err_probe(dev, -EPROBE_DEFER,
 				     "waiting for fwnode graph endpoint\n");
+	/* NOT-UPSTREAM end */
 
 	ret = v4l2_fwnode_endpoint_alloc_parse(ep, &bus_cfg);
 	fwnode_handle_put(ep);
@@ -2730,10 +2575,7 @@ static int ov32c4_probe(struct i2c_client *client)
 	 * to come from a regulator, so its absence is not an error here.
 	 */
 	ov32c4->companion_addr = ov32c4_acpi_i2c_addr(ov32c4->dev, 1);
-	if (ov32c4->companion_addr)
-		dev_dbg(ov32c4->dev, "companion chip at i2c 0x%02x\n",
-			ov32c4->companion_addr);
-	else if (ACPI_COMPANION(ov32c4->dev))
+	if (!ov32c4->companion_addr && ACPI_COMPANION(ov32c4->dev))
 		dev_warn(ov32c4->dev,
 			 "no second I2C address in _CRS, core rail may stay off\n");
 
@@ -2746,12 +2588,6 @@ static int ov32c4_probe(struct i2c_client *client)
 	ret = ov32c4_identify_module(ov32c4);
 	if (ret)
 		goto probe_error_power_off;
-
-	dev_dbg(ov32c4->dev,
-		"link freq %lld Hz, %u lanes, pixel rate %llu, ppl %u\n",
-		link_freq_menu_items[ov32c4->link_freq_index],
-		ov32c4->mipi_lanes, ov32c4_pixel_rate(ov32c4),
-		ov32c4_ppl(ov32c4, &supported_modes[0]));
 
 	ret = ov32c4_init_controls(ov32c4);
 	if (ret) {
@@ -2787,6 +2623,7 @@ static int ov32c4_probe(struct i2c_client *client)
 	}
 
 	pm_runtime_idle(ov32c4->dev);
+
 	return 0;
 
 probe_error_v4l2_subdev_cleanup:

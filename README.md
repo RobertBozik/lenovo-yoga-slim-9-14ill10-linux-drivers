@@ -137,11 +137,20 @@ A file that was already there and is not ours is kept as
 ## Upstream
 
 The kernel side is on its way in. The series — device tree bindings,
-the sensor driver, and the one-line `ipu-bridge` entry — was posted to
-linux-media on 2026-08-26
-([lore](https://lore.kernel.org/linux-media/20260826072002.14357-1-robertbozik@gmail.com/)).
-The bindings have been reviewed and agreed; the driver review is
-pending. The patches are in `upstream/`.
+the sensor driver, and the one-line `ipu-bridge` entry — is at v3, posted
+to linux-media on 2026-08-29
+([lore](https://lore.kernel.org/linux-media/20260829115832.8749-1-robertbozik@gmail.com/)).
+The bindings are acked; the driver has been through one round of review
+and the review comments are addressed in v3. The patches are in
+`upstream/`.
+
+The driver here carries one block the upstream patches do not, fenced
+with `NOT-UPSTREAM`: kernels up to 7.0 return `-EINVAL` instead of
+`-EPROBE_DEFER` when the sensor probes before `ipu-bridge` has built the
+fwnode graph, and the probe is then never retried — so on those kernels
+the camera would not come up on roughly half the boots. Newer kernels
+handle it themselves. `scripts/to-upstream.sh` removes the block when
+copying the driver into a kernel tree.
 
 The libcamera side is not going upstream for now, so the nineteen
 patches in `upstream/libcamera/` are carried here and applied at install

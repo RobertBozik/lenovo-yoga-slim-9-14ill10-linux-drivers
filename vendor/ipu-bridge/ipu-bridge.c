@@ -101,14 +101,7 @@ static const struct ipu_sensor_config ipu_supported_sensors[] = {
 	IPU_SENSOR_CONFIG("OVTIDB10", 1, 560000000),
 	/* Omnivision OV2680 */
 	IPU_SENSOR_CONFIG("OVTI2680", 1, 331200000),
-	/*
-	 * Omnivision OV32C4.
-	 *
-	 * 400 MHz = 800 Mbps per lane. Read out of ov32c4.sys, where the
-	 * mode descriptor carries it as MipiBps (bits per second), and
-	 * confirmed on the machine: the IPU7 D-PHY locks and the sensor
-	 * streams 3264x1840 at a measured 30.00 fps.
-	 */
+	/* Omnivision OV32C4 */
 	IPU_SENSOR_CONFIG("OVTI32C4", 1, 400000000),
 	/* Omnivision OV8856 */
 	IPU_SENSOR_CONFIG("OVTI8856", 3, 180000000, 360000000, 720000000),
