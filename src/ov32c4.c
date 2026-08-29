@@ -1965,6 +1965,7 @@ struct ov32c4 {
 	u8 mipi_lanes;
 };
 
+#ifdef CONFIG_ACPI
 /*
  * Walk the sensor's ACPI _CRS and return the address of the n-th
  * I2cSerialBus resource. Index 0 is the sensor itself (the kernel binds the
@@ -2005,6 +2006,12 @@ static u16 ov32c4_acpi_i2c_addr(struct device *dev, int index)
 
 	return ret < 0 ? 0 : ctx.addr;
 }
+#else
+static u16 ov32c4_acpi_i2c_addr(struct device *dev, int index)
+{
+	return 0;
+}
+#endif
 
 static inline struct ov32c4 *to_ov32c4(struct v4l2_subdev *subdev)
 {
@@ -2025,6 +2032,7 @@ static int ov32c4_set_ctrl(struct v4l2_ctrl *ctrl)
 	const u32 height = supported_modes[0].height;
 	s64 exposure_max;
 	int ret = 0;
+	int pm;
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		exposure_max = height + ctrl->val - OV32C4_EXPOSURE_MAX_MARGIN;
@@ -2037,7 +2045,13 @@ static int ov32c4_set_ctrl(struct v4l2_ctrl *ctrl)
 			return ret;
 	}
 
-	if (!pm_runtime_get_if_active(ov32c4->dev))
+	/*
+	 * A negative return means runtime PM is disabled for the device, in
+	 * which case it is powered and the registers can be written, but no
+	 * reference was taken and none may be dropped below.
+	 */
+	pm = pm_runtime_get_if_active(ov32c4->dev);
+	if (!pm)
 		return 0;
 
 	switch (ctrl->id) {
@@ -2084,7 +2098,8 @@ static int ov32c4_set_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	}
 
-	pm_runtime_put(ov32c4->dev);
+	if (pm > 0)
+		pm_runtime_put(ov32c4->dev);
 
 	return ret;
 }
@@ -2171,6 +2186,10 @@ static void ov32c4_update_pad_format(const struct ov32c4_mode *mode,
 	fmt->height = mode->height;
 	fmt->code = MEDIA_BUS_FMT_SGRBG10_1X10;
 	fmt->field = V4L2_FIELD_NONE;
+	fmt->colorspace = V4L2_COLORSPACE_RAW;
+	fmt->ycbcr_enc = V4L2_MAP_YCBCR_ENC_DEFAULT(fmt->colorspace);
+	fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	fmt->xfer_func = V4L2_XFER_FUNC_NONE;
 }
 
 static int ov32c4_enable_streams(struct v4l2_subdev *sd,
