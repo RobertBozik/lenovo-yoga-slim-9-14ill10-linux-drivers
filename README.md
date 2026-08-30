@@ -80,6 +80,26 @@ for this machine, because its quirk table has no entry for PCI SSID
 ([bugzilla #221902](https://bugzilla.kernel.org/show_bug.cgi?id=221902))
 the model is forced by hand.
 
+Once they play, the balance may not be to your taste: the woofers run at
+their full calibrated gain and nothing in the path splits the bands or
+corrects the response, which is what the vendor DSP does under Windows.
+The woofers are driven by the two Cirrus CS35L56 amplifiers and have their
+own volume, separate from the tweeters, so the balance is a one-line
+change. Measured on this machine: `400` is 0 dB, four steps make a
+decibel, and muting these two controls while music plays removes the bass
+and leaves everything else, which is how the assignment was confirmed.
+
+```sh
+amixer -c0 sset 'AMP1 Speaker' 386      # -3.5 dB
+amixer -c0 sset 'AMP2 Speaker' 386
+sudo alsactl store                      # survives a reboot
+```
+
+Both amplifiers have to be set; they are separate mono controls, one per
+side. `alsamixer -c0` (F5 for all controls) does the same thing by ear.
+The installer does not touch this - it is a matter of taste, and -3.5 dB
+is only what one pair of ears preferred.
+
 **A screen that stops blanking.** Panel self-refresh and panel replay are
 disabled for the Xe driver through the kernel command line. The cost is a
 little more power when the screen is idle.
