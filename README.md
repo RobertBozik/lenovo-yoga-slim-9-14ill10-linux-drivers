@@ -148,11 +148,53 @@ libcamera back.
 A file that was already there and is not ours is kept as
 `<name>.ov32c4.bak` and put back on uninstall.
 
+## Secure Boot
+
+Everything here runs with Secure Boot enabled, so a dual-boot machine
+does not need a trip into the firmware setup between operating systems.
+Two things are in the way out of the box, and they are unrelated to each
+other.
+
+**The firmware does not accept the shim.** With Secure Boot on, this
+machine refuses to load `\EFI\ubuntu\shimx64.efi` and falls through to
+the next boot entry, so Linux appears to have vanished. The boot entry
+and the binaries are fine: Canonical's shim is signed by *Microsoft
+Corporation UEFI CA 2011*, and that certificate is not in this firmware's
+`db`, which holds only the Windows and Lenovo certificates. Compare the
+two yourself:
+
+```sh
+sudo efi-readvar -v db | grep CN=
+sudo sbverify --list /boot/efi/EFI/ubuntu/shimx64.efi | grep CN=
+```
+
+The fix is one setting: **F2 → Security → Secure Boot → `Allow Microsoft
+3rd Party UEFI CA` = Enabled**, which adds that certificate to `db`, then
+`Secure Boot = Enabled`. The same menu offers `Reset to Setup Mode` and
+`Restore Factory Keys` if you ever need to write `db` by hand.
+
+**The modules need a key the firmware trusts.** DKMS already signs them
+with the machine's own MOK — `modinfo -F signer ov32c4` shows it — but
+that key has to be enrolled once:
+
+```sh
+sudo mokutil --import /var/lib/shim-signed/mok/MOK.der
+```
+
+It asks for a one-time password. Reboot, and MokManager comes up: *Enroll
+MOK* → *Continue* → *Yes* → the password. `mokutil --list-enrolled`
+should then show the machine's own key. Kernel updates need no repeat:
+DKMS rebuilds and re-signs with the same key.
+
+Two things are worth knowing. A running kernel ignores MOK keys entirely
+while Secure Boot is off — `.machine` stays empty and there is no
+`UEFI:MokListRT` line in the log — so testing this with
+`module.sig_enforce=1` and Secure Boot off fails and proves nothing. And
+with Secure Boot on the kernel is in lockdown, which disables hibernation;
+suspend to RAM is unaffected.
+
 ## Known limitations
 
-* **Secure Boot has to be off.** Not because of the modules — DKMS signs
-  them with the machine's MOK — but because this machine's firmware does
-  not accept the shim at all; with Secure Boot on, Linux does not boot.
 * **In very low light the picture is noisy** and can pick up a colour
   cast. At that point the ISP is running at high digital gain and the
   sensor is small; this is the limit of the hardware more than of the
