@@ -193,6 +193,30 @@ while Secure Boot is off — `.machine` stays empty and there is no
 with Secure Boot on the kernel is in lockdown, which disables hibernation;
 suspend to RAM is unaffected.
 
+**The boot menu on a 4K panel.** With Secure Boot on, this GRUB refuses to
+load a font at all — `loadfont` answers `prohibited by secure boot policy`
+— and `grub-mkconfig` puts `set gfxmode` *inside* the `if loadfont` block,
+so the video mode is never applied either. GRUB then falls back to the
+firmware's text console, which on a 3840-pixel-wide panel is a 5 cm square
+in the top-left corner. Since the font cannot grow, lower the resolution
+instead, from outside that block:
+
+```sh
+sudo tee /etc/grub.d/00_gfxmode >/dev/null <<'SH'
+#!/bin/sh
+echo "set gfxmode=1024x768x32,1024x768,1280x1024,auto"
+SH
+sudo chmod +x /etc/grub.d/00_gfxmode
+echo GRUB_TERMINAL_OUTPUT=gfxterm | sudo tee -a /etc/default/grub
+sudo update-grub
+```
+
+GRUB's built-in font is a fixed 8x16, so at 1024x768 it is about four
+times larger on the panel. The menu border is drawn as question marks
+because that font has no box-drawing glyphs, and a graphical GRUB theme
+cannot be used at all here for the same reason a font cannot: a theme is
+a directory of files GRUB would have to load.
+
 ## Known limitations
 
 * **In very low light the picture is noisy** and can pick up a colour
