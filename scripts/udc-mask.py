@@ -223,9 +223,16 @@ def mask_wanted(led):
     state = loopback_state()
     if state is not None:
         feeder, readers = state
-        if feeder:
-            return readers > 0
-        if readers > 0:
+        # The dot is up whenever the sensor is capturing, which includes
+        # the feeder's grace period after the last reader left.  It used to
+        # go away as soon as nobody was watching, which looked tidier and
+        # was wrong twice over: the sensor keeps capturing through an
+        # uncovered lens, and an application that reopens the node during
+        # the grace period gets a frame at once - the feeder is already
+        # writing them - while the mask still needs a poll and a window
+        # map.  Measured: about 90 ms, which is two or three frames of the
+        # panel's own pixels at the start of every warm restart.
+        if feeder or readers > 0:
             return True
     return camera_active(led)
 
