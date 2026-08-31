@@ -72,6 +72,16 @@ so the lens sees nothing. Calibrate the position once:
 python3 /usr/local/bin/udc-mask.py --calibrate
 ```
 
+The position is kept in millimetres from the panel edge, not in pixels,
+so a different resolution or desktop scale does not invalidate the
+calibration. It does invalidate what the running process believes: Qt
+keeps the screen data it read at startup and reports the old geometry,
+scale and DPI after the change. The service therefore watches
+`~/.config/kwinoutputconfig.json` and re-executes itself when the
+compositor rewrites it, which takes about a second; under a compositor
+that does not write that file, restart the service by hand after changing
+the display (`systemctl --user restart udc-mask`).
+
 **Both speakers.** Out of the box pin `0x17` is connected to the wrong
 source: the woofers stay silent and the volume control is not even in the
 audible path. The kernel already has the right fixup but does not pick it

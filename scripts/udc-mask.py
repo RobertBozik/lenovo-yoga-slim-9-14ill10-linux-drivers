@@ -42,6 +42,7 @@ import argparse
 import glob
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -64,12 +65,27 @@ LED_GLOB = "/sys/class/leds/*OVTI32C4*privacy*/brightness"
 # browser started with the right flag) the privacy LED decides.
 STATE_FILE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
                           "ov32c4-camera-state")
+# Changing the desktop scaling moves the dot off the lens, and a running
+# process cannot see it coming: measured on Plasma 6.6, going from 210 %
+# to 225 % leaves QScreen.geometry(), devicePixelRatio() and
+# logicalDotsPerInch() all reporting the values they had at startup, and
+# geometryChanged never fires.  Recomputing the position is therefore
+# useless - the inputs are stale, not the arithmetic.  What does change is
+# this file, which the compositor rewrites when the output configuration
+# is applied, so the mask watches it and re-executes itself to get a fresh
+# look at the screen.  Where the file does not exist nothing is watched
+# and the position holds until the service is restarted by hand.
+DISPLAY_CONFIG = os.path.expanduser("~/.config/kwinoutputconfig.json")
+# Applying a new mode takes a moment and rewrites the file more than once.
+RESTART_SETTLE = 1.5
 POLL_MS = 100
 # The position is PHYSICAL (mm), not in pixels: the dot is horizontally
 # centred on the panel (offset dx_mm), dy_mm from the top edge, diameter
-# d_mm.  Pixels are computed from the panel size in the EDID for whatever
-# screen is current, so changing the desktop scaling no longer moves the
-# dot (measured: 215 % -> 225 % had moved it by about a centimetre).
+# d_mm.  Pixels are computed from the panel size in the EDID and from the
+# screen Qt reports.  That arithmetic is right but it is only as fresh as
+# Qt's idea of the screen, which is why the scale change is handled by the
+# restart above and not by recomputing in place (measured: 210 % -> 225 %
+# moved the dot by about a centimetre and nothing recomputed it).
 DEFAULT = {"dx_mm": 0.0, "dy_mm": 1.0, "d_mm": 12.0, "calibrated": False}
 EDID_GLOB = "/sys/class/drm/card*-eDP-*/edid"
 
@@ -87,6 +103,15 @@ RestartSec=5
 [Install]
 WantedBy=graphical-session.target
 """
+
+
+def display_stamp():
+    """Something that changes when the output configuration changes."""
+    try:
+        st = os.stat(DISPLAY_CONFIG)
+        return st.st_mtime_ns, st.st_size
+    except OSError:
+        return None
 
 
 def load_config():
@@ -342,12 +367,25 @@ def run_daemon(cfg):
         sys.exit("no privacy LED found (%s) - are the ov32c4 and INT3472 "
                  "drivers loaded?" % LED_GLOB)
 
+    # Qt installs its own handler and then ignores Ctrl+C in the event
+    # loop; without this the daemon can only be killed from another shell.
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     app = QApplication(sys.argv)
     mask = Mask(cfg)
-    state = {"on": False}
+    state = {"on": False, "display": display_stamp(), "changed_at": None}
     app.primaryScreen().geometryChanged.connect(lambda _: mask.apply(cfg))
 
     def tick():
+        stamp = display_stamp()
+        if stamp != state["display"]:
+            state["display"] = stamp
+            state["changed_at"] = time.monotonic()
+        if (state["changed_at"] is not None and
+                time.monotonic() - state["changed_at"] > RESTART_SETTLE):
+            print("display configuration changed, restarting", flush=True)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
         on = mask_wanted(led)
         if on == state["on"]:
             return
