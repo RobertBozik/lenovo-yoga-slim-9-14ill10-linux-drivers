@@ -278,3 +278,11 @@ cat /sys/class/dmi/id/product_version /sys/class/dmi/id/product_name
 uname -r
 journalctl -k -b | grep -iE 'ov32c4|ipu|intel_ipu7'
 ```
+
+## About
+
+Written and maintained by Robert Bozik of
+[Exon Slovakia](https://www.exonslovakia.com/linux-open-source), an IT company
+in Slovakia doing Linux infrastructure, kernel and driver work, and custom
+software development. If you need a driver for hardware without Linux support,
+or Linux running properly in a company, get in touch.
