@@ -13,7 +13,6 @@ ceilings and paper are the likely neutral surfaces), zones strongly
 coloured after the current white balance weigh less, and zones near
 black or clipped are ignored.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/awb.cpp | 65 ++++++++++++++++++++++++++++++
  src/ipa/softisp/algorithms/awb.h   |  2 +

@@ -13,7 +13,6 @@ Use one bin per 10-bit level and derive the black level index from the
 number of bins per 8-bit level instead of the (now zero) inverse ratio.
 8-bit inputs simply leave every fourth bin empty.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  include/libcamera/internal/software_isp/swisp_stats.h | 10 +++++++++-
  src/ipa/softisp/algorithms/agc.cpp                    |  2 +-

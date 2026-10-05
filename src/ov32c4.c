@@ -2,6 +2,8 @@
 /*
  * OmniVision OV32C4 image sensor driver.
  *
+ * Copyright (C) 2026 Robert Bozik
+ *
  * The sensor ships in laptops with an Intel IPU7, where it is enumerated
  * through ACPI _HID "OVTI32C4". There is no public datasheet; the 400 MHz
  * link frequency comes from the vendor driver, which carries it as bits per
@@ -54,15 +56,22 @@
 #define OV32C4_CHIP_ID			0x563243
 
 #define OV32C4_REG_STREAM_CONTROL	CCI_REG8(0x0100)
+#define OV32C4_REG_SW_RESET		CCI_REG8(0x0103)
+/* The vendor driver issues the reset itself and waits this long after it. */
+#define OV32C4_SW_RESET_SETTLE_US	10000
 
 /*
- * The sensor does not answer on I2C at all until this register is written in
- * a companion chip, which the ACPI _CRS of the sensor lists as its second
- * I2cSerialBus resource. The write is issued as a plain i2c_transfer and the
- * address is deliberately not claimed with i2c_new_dummy_device(), so that
- * the driver the platform assigns to that address can still bind.
+ * The sensor has a second I2C address, listed as the second I2cSerialBus
+ * resource of its ACPI _CRS, behind which sits a small register block of
+ * its own. Until 0x1001 there is written, the main address does not answer
+ * at all. The block is part of the sensor: it is unreachable while the
+ * sensor is unpowered or held in reset, starts answering about a millisecond
+ * after reset is released, loses the value written to 0x1001 over a power
+ * cycle, and has no ACPI device of its own. The same register pair exists in
+ * OV08X40 (AO_STANDBY at 0x1000, MS_SELECT at 0x1001, 0x04 for streaming)
+ * at that sensor's main address.
  */
-#define OV32C4_COMPANION_ENABLE_REG	0x1001
+#define OV32C4_COMPANION_ENABLE_REG	CCI_REG8(0x1001)
 #define OV32C4_COMPANION_ENABLE_VAL	0x04
 
 /* Vertical timing */
@@ -126,17 +135,26 @@ static const char * const ov32c4_supply_names[] = {
 	"avdd",		/* Analog power */
 };
 
-/* Power-up timings; there is no public datasheet for this sensor. */
-#define OV32C4_AVDD_SETTLE_US		5000
-#define OV32C4_RESET_SETTLE_US		20000
+/*
+ * Power-up timing; there is no public datasheet for this sensor. The
+ * regulator core already waits for the supply to settle. Measured on the
+ * hardware, the block behind the second address answers about 1 ms after
+ * reset is released, and the main address answers within 1 ms of the
+ * enable write; 5 ms and 1 ms leave a margin over that.
+ */
+#define OV32C4_RESET_SETTLE_US		5000
+#define OV32C4_ENABLE_SETTLE_US		1000
 
 /*
  * Mode 3264x1840 @ 30 fps, 4 lanes, SGRBG10. The 15 fps variant of the same
  * table differs only in VTS, which V4L2_CID_VBLANK covers.
+ *
+ * This is the vendor driver's list for the mode, minus its first two
+ * entries: the stream-off and the software reset, which the driver issues
+ * itself in ov32c4_enable_streams() so that the settle time after the reset
+ * can be a sleep rather than a delay inside a register sequence.
  */
 static const struct reg_sequence ov32c4_mode_3264x1840_regs[] = {
-	{ 0x0100, 0x00 },
-	{ 0x0103, 0x01, 10000 },	/* sw reset + settle */
 	{ 0x0301, 0xc8 },
 	{ 0x0303, 0x04 },
 	{ 0x0304, 0x02 },
@@ -1947,7 +1965,8 @@ struct ov32c4 {
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct regmap *regmap;
 
-	/* Companion chip that gates the sensor, see OV32C4_COMPANION_ENABLE_REG */
+	/* The sensor's second I2C address, see OV32C4_COMPANION_ENABLE_REG */
+	struct regmap *companion;
 	u16 companion_addr;
 
 	/* V4L2 controls */
@@ -2204,6 +2223,14 @@ static int ov32c4_enable_streams(struct v4l2_subdev *sd,
 	if (ret)
 		return ret;
 
+	cci_write(ov32c4->regmap, OV32C4_REG_STREAM_CONTROL, 0, &ret);
+	cci_write(ov32c4->regmap, OV32C4_REG_SW_RESET, 1, &ret);
+	if (ret) {
+		dev_err(ov32c4->dev, "failed to reset the sensor: %d\n", ret);
+		goto out;
+	}
+	fsleep(OV32C4_SW_RESET_SETTLE_US);
+
 	ret = regmap_multi_reg_write(ov32c4->regmap, mode->reg_sequence,
 				     mode->sequence_length);
 	if (ret) {
@@ -2254,31 +2281,11 @@ static int ov32c4_get_pm_resources(struct device *dev)
 				       ov32c4->supplies);
 }
 
-/*
- * Ungate the sensor through the companion chip, see
- * OV32C4_COMPANION_ENABLE_REG.
- */
+/* Ungate the main address, see OV32C4_COMPANION_ENABLE_REG. */
 static int ov32c4_companion_enable(struct ov32c4 *ov32c4)
 {
-	struct i2c_client *client = to_i2c_client(ov32c4->dev);
-	u8 wr[3] = {
-		OV32C4_COMPANION_ENABLE_REG >> 8,
-		OV32C4_COMPANION_ENABLE_REG & 0xff,
-		OV32C4_COMPANION_ENABLE_VAL,
-	};
-	struct i2c_msg msg = {
-		.addr = ov32c4->companion_addr,
-		.flags = 0,
-		.len = sizeof(wr),
-		.buf = wr,
-	};
-	int ret;
-
-	ret = i2c_transfer(client->adapter, &msg, 1);
-	if (ret == 1)
-		return 0;
-
-	return ret < 0 ? ret : -EIO;
+	return cci_write(ov32c4->companion, OV32C4_COMPANION_ENABLE_REG,
+			 OV32C4_COMPANION_ENABLE_VAL, NULL);
 }
 
 static int ov32c4_power_off(struct device *dev)
@@ -2314,22 +2321,31 @@ static int ov32c4_power_on(struct device *dev)
 		return ret;
 	}
 
-	fsleep(OV32C4_AVDD_SETTLE_US);
-
 	if (ov32c4->reset) {
 		gpiod_set_value_cansleep(ov32c4->reset, 0);
 		fsleep(OV32C4_RESET_SETTLE_US);
 	}
 
-	if (ov32c4->companion_addr) {
+	if (ov32c4->companion) {
 		ret = ov32c4_companion_enable(ov32c4);
-		if (ret)
-			dev_err(dev, "companion at 0x%02x did not accept the enable write: %d\n",
+		if (ret) {
+			dev_err(dev, "the block at 0x%02x did not accept the enable write: %d\n",
 				ov32c4->companion_addr, ret);
-		fsleep(1000);
+			goto err_power_off;
+		}
+		fsleep(OV32C4_ENABLE_SETTLE_US);
 	}
 
 	return 0;
+
+err_power_off:
+	if (ov32c4->reset)
+		gpiod_set_value_cansleep(ov32c4->reset, 1);
+	regulator_bulk_disable(ARRAY_SIZE(ov32c4_supply_names),
+			       ov32c4->supplies);
+	clk_disable_unprepare(ov32c4->img_clk);
+
+	return ret;
 }
 
 static int ov32c4_set_format(struct v4l2_subdev *sd,
@@ -2588,15 +2604,32 @@ static int ov32c4_probe(struct i2c_client *client)
 		return PTR_ERR(ov32c4->regmap);
 
 	/*
-	 * On the ACPI machines this sensor ships in, the core rail is gated by
-	 * a companion chip listed as the second I2C resource of _CRS; without
-	 * it the sensor does not answer at all. Elsewhere the rail is expected
-	 * to come from a regulator, so its absence is not an error here.
+	 * On the ACPI machines this sensor ships in, the main address only
+	 * answers after a write to the sensor's second address, listed as the
+	 * second I2C resource of _CRS (see OV32C4_COMPANION_ENABLE_REG). The
+	 * address is claimed here so that nothing else binds to it; the
+	 * platform's SSDB wrongly calls it a VCM, and ipu-bridge knows not to
+	 * instantiate one for this sensor.
 	 */
 	ov32c4->companion_addr = ov32c4_acpi_i2c_addr(ov32c4->dev, 1);
-	if (!ov32c4->companion_addr && ACPI_COMPANION(ov32c4->dev))
+	if (ov32c4->companion_addr) {
+		struct i2c_client *companion;
+
+		companion = devm_i2c_new_dummy_device(ov32c4->dev,
+						      client->adapter,
+						      ov32c4->companion_addr);
+		if (IS_ERR(companion))
+			return dev_err_probe(ov32c4->dev, PTR_ERR(companion),
+					     "failed to claim the second address 0x%02x\n",
+					     ov32c4->companion_addr);
+
+		ov32c4->companion = devm_cci_regmap_init_i2c(companion, 16);
+		if (IS_ERR(ov32c4->companion))
+			return PTR_ERR(ov32c4->companion);
+	} else if (ACPI_COMPANION(ov32c4->dev)) {
 		dev_warn(ov32c4->dev,
-			 "no second I2C address in _CRS, core rail may stay off\n");
+			 "no second I2C address in _CRS, the sensor may not answer\n");
+	}
 
 	ret = ov32c4_power_on(ov32c4->dev);
 	if (ret) {

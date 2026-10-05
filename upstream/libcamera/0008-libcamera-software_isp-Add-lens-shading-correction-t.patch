@@ -15,7 +15,6 @@ passes it to the debayer through the parameters, and apply it in the
 EGL debayer as a linearly filtered RGB8 texture right after the black
 level subtraction. The CPU debayer warns once and ignores the table.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  .../internal/software_isp/debayer_params.h    |  15 +++
  src/ipa/softisp/algorithms/lsc.cpp            | 106 ++++++++++++++++++

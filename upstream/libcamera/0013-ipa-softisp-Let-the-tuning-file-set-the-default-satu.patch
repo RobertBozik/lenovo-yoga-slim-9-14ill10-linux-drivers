@@ -9,7 +9,6 @@ Saturation control. Let the tuning file set the saturation the camera
 starts with (saturation, 1.0 keeps the current behaviour); the control
 still overrides it.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/adjust.cpp | 15 ++++++++++++++-
  src/ipa/softisp/algorithms/adjust.h   |  1 +

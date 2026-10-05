@@ -14,7 +14,6 @@ linear level instead. It is expressed as the equivalent mean sample
 value so that the update logic, including the settling and the
 highlight protection, is shared. The default of 0 keeps the mean.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/agc.cpp | 42 +++++++++++++++++++++++++++---
  src/ipa/softisp/algorithms/agc.h   |  1 +

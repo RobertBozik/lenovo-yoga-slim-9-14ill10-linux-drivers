@@ -16,7 +16,6 @@ as the bins are coarse for the signal of a dark scene. Gain already past
 the level is pulled back down. The default of 0 keeps the current
 behaviour.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/agc.cpp | 84 ++++++++++++++++++++++++++++--
  src/ipa/softisp/algorithms/agc.h   |  5 +-

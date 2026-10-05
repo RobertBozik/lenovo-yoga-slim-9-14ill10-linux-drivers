@@ -219,6 +219,12 @@ a directory of files GRUB would have to load.
 
 ## Known limitations
 
+* **Black frames and no error anywhere means the camera switch is off.**
+  With the hardware camera switch off, the sensor still answers on I2C,
+  reports streaming, the privacy LED lights, CSI-2 packets arrive and the
+  ISYS hands over frames — every sample in them is zero, at any exposure
+  and gain. Nothing in `dmesg` or libcamera says a word. Flip the switch
+  before debugging anything else.
 * **In very low light the picture is noisy** and can pick up a colour
   cast. At that point the ISP is running at high digital gain and the
   sensor is small; this is the limit of the hardware more than of the
@@ -233,12 +239,13 @@ a directory of files GRUB would have to load.
 ## Upstream
 
 The kernel side is on its way in. The series — device tree bindings,
-the sensor driver, and the one-line `ipu-bridge` entry — is at v3, posted
-to linux-media on 2026-08-29
-([lore](https://lore.kernel.org/linux-media/20260829115832.8749-1-robertbozik@gmail.com/)).
-The bindings are acked; the driver has been through one round of review
-and the review comments are addressed in v3. The patches are in
-`upstream/`.
+the sensor driver, and the `ipu-bridge` entry — is at v4, posted to
+linux-media on 2026-10-05
+([lore](https://lore.kernel.org/linux-media/20261005071010.7191-1-robertbozik@gmail.com/)).
+The bindings are acked; the driver has been through one round of review,
+and v4 closes the last open question — who owns the sensor's second I2C
+address — with a measurement rather than a guess. The patches and the
+story behind them are in `upstream/`.
 
 The driver here carries one block the upstream patches do not, fenced
 with `NOT-UPSTREAM`: kernels up to 7.0 return `-EINVAL` instead of
@@ -260,8 +267,9 @@ GPL-2.0, matching the kernel code, with per-file `SPDX-License-Identifier`
 tags: the device tree binding is `GPL-2.0 OR BSD-2-Clause` as the kernel
 requires, and the tuning file is `CC0-1.0`.
 
-`vendor/ipu-bridge/ipu-bridge.c` is the kernel's own file with one line
-added; its provenance is in `vendor/ipu-bridge/README.md`.
+`vendor/ipu-bridge/ipu-bridge.c` is the kernel's own file with the
+sensor entry and a small exception added; its provenance is in
+`vendor/ipu-bridge/README.md`.
 
 The colour matrices and the white point curve in `tuning/ov32c4.yaml`
 were decoded from the tuning data that shipped with this camera module;

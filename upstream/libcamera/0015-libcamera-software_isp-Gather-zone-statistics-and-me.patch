@@ -15,7 +15,6 @@ then taken from a blend of the whole frame and the centre, and the
 highlight protection looks at the centre only, so that the background
 is allowed to clip. The default of 0 keeps the whole-frame metering.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  .../internal/software_isp/swisp_stats.h       | 32 +++++++
  .../internal/software_isp/swstats_cpu.h       | 31 ++++---

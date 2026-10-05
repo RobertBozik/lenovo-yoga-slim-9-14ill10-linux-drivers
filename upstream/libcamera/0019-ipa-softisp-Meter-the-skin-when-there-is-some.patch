@@ -15,7 +15,6 @@ how much skin was found and to the weight. The highlight guard then
 protects the skin and lets the background clip. A beige wall or wood
 is far enough from skin in chromaticity after the matrix not to match.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/agc.cpp | 75 ++++++++++++++++++++++++++++++
  src/ipa/softisp/algorithms/agc.h   |  1 +

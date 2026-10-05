@@ -1,7 +1,7 @@
-From f3a3084220fedeb20624ec2d706f2b824ff9a042 Mon Sep 17 00:00:00 2001
+From 29038138515269ec190ca741b3687bd6096535e1 Mon Sep 17 00:00:00 2001
 From: Robert Bozik <robertbozik@gmail.com>
 Date: Mon, 24 Aug 2026 11:58:24 +0000
-Subject: [PATCH v3 1/3] dt-bindings: media: i2c: Add OmniVision OV32C4
+Subject: [PATCH v4 1/3] dt-bindings: media: i2c: Add OmniVision OV32C4
 
 Add a binding for the OmniVision OV32C4, a 32 megapixel RGBC CMOS image
 sensor with on-chip 4-cell fusion, a 4-lane MIPI CSI-2 D-PHY transmitter
@@ -11,13 +11,11 @@ The sensor ships in laptops as an under-display camera, where it is
 described by ACPI; the binding follows ovti,ov08x40.yaml, which covers
 the closest relative already in tree.
 
-Assisted-by: Claude:claude-opus-5 sparse
-Assisted-by: Claude:claude-fable-5 sparse
 Acked-by: Conor Dooley <conor.dooley@microchip.com>
 Signed-off-by: Robert Bozik <robertbozik@gmail.com>
 ---
-Changes in v3:
-- No changes to the binding itself; picked up Conor Dooley's Acked-by.
+Changes in v4:
+- No changes to the binding.
 
  .../bindings/media/i2c/ovti,ov32c4.yaml       | 105 ++++++++++++++++++
  1 file changed, 105 insertions(+)

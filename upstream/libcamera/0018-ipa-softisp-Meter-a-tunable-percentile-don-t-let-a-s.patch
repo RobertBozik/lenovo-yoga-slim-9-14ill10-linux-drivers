@@ -14,7 +14,6 @@ the way up, so the brightest zone, typically a screen or a lamp and
 rarely neutral, drove the balance. Saturate the brightness weight at
 40 % of the brightest zone and weigh down zones above 85 % of it.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/agc.cpp | 27 ++++++++++++++++++---------
  src/ipa/softisp/algorithms/agc.h   |  1 +

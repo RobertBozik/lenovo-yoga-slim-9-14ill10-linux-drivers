@@ -16,7 +16,6 @@ matches the line through the origin, and that line below it. The IPA
 computes the threshold and the slope, both debayers apply them. The
 default offset of 0 keeps the plain power function.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  .../internal/software_isp/debayer_params.h    |  9 +++++
  src/ipa/softisp/algorithms/adjust.cpp         | 33 ++++++++++++++++++-

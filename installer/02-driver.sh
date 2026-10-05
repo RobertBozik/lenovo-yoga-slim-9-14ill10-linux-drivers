@@ -39,11 +39,13 @@ install)
 		[ -e "$f" ] && { info "removing stale manual copy $f"; rm -f "$f"; }
 	done
 
-	if dkms status "$NAME/$VER" 2>/dev/null | grep -q .; then
-		dkms remove "$NAME/$VER" --all >/dev/null
+	# A package stays registered after "dkms remove", so a second "dkms
+	# add" is refused; register once, then rebuild from the refreshed
+	# source whenever this step runs again.
+	if [ -z "$(dkms status "$NAME/$VER" 2>/dev/null)" ]; then
+		dkms add "$NAME/$VER" >/dev/null
 	fi
-	dkms add "$NAME/$VER" >/dev/null
-	dkms build "$NAME/$VER" -k "$KVER"
+	dkms build "$NAME/$VER" -k "$KVER" --force
 	dkms install "$NAME/$VER" -k "$KVER" --force
 	depmod -a "$KVER"
 
@@ -59,7 +61,7 @@ install)
 
 uninstall)
 	need_root
-	if dkms status "$NAME/$VER" 2>/dev/null | grep -q .; then
+	if [ -n "$(dkms status "$NAME/$VER" 2>/dev/null)" ]; then
 		dkms remove "$NAME/$VER" --all
 	fi
 	rm -rf "$SRC"
@@ -68,7 +70,7 @@ uninstall)
 	;;
 
 check)
-	if dkms status "$NAME/$VER" 2>/dev/null | grep -q "$KVER"; then
+	if dkms status "$NAME/$VER" 2>/dev/null | grep -c "$KVER" >/dev/null; then
 		report dkms ok "$(dkms status "$NAME/$VER" | head -1)"
 	else
 		report dkms missing "not built for $KVER"

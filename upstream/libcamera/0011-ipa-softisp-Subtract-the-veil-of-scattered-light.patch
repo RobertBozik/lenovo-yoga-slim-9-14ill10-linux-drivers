@@ -15,7 +15,6 @@ is treated as veil, bounded by veilMax. The veil is assumed neutral, so
 it is subtracted per channel in proportion to the inverse white balance
 gains, on top of the black level, and smoothed over frames.
 
-Assisted-by: Claude:claude-fable-5 [Claude Code]
 ---
  src/ipa/softisp/algorithms/blc.cpp | 102 ++++++++++++++++++++++++++++-
  src/ipa/softisp/algorithms/blc.h   |   6 ++

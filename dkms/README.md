@@ -24,11 +24,12 @@ finds the entity, and `wpctl status` lists the camera.
 ## The risk DKMS does not remove
 
 `vendor/ipu-bridge/ipu-bridge.c` is a copy of the kernel's own file with
-one line added. If a later kernel changes `include/media/ipu-bridge.h`
-or that file, the build fails — and because both modules are one DKMS
-package, `ov32c4` does not get installed either. The fix is to take the
-new `ipu-bridge.c` from that kernel's source, add the line back (see
-`vendor/ipu-bridge/README.md`), and run the step again. The permanent
+the sensor entry and the no-VCM exception added. If a later kernel
+changes `include/media/ipu-bridge.h` or that file, the build fails — and
+because both modules are one DKMS package, `ov32c4` does not get
+installed either. The fix is to take the new `ipu-bridge.c` from that
+kernel's source, add the changes back (see `vendor/ipu-bridge/README.md`),
+and run the step again. The permanent
 fix is the series being merged; see `upstream/`.
 
 ## Device node permissions
