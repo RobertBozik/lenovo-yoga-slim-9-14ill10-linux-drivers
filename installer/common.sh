@@ -81,18 +81,48 @@ apt_need() {
 	fi
 }
 
+# Every file install_file writes is recorded here with its hash, so that
+# a later run can tell our own older copy (after a git pull) from a file
+# somebody else put there. Without it the older copy was taken for a
+# foreign file, kept as .bak, and put back by the uninstall.
+MANIFEST="${OV32C4_MANIFEST:-/var/lib/ov32c4-installer/installed}"
+
+manifest_hash() {
+	[ -f "$MANIFEST" ] || return 0
+	awk -v p="$1" '$2 == p { h = $1 } END { if (h != "") print h }' "$MANIFEST"
+}
+
+manifest_forget() {
+	[ -f "$MANIFEST" ] || return 0
+	awk -v p="$1" '$2 != p' "$MANIFEST" >"$MANIFEST.tmp"
+	mv "$MANIFEST.tmp" "$MANIFEST"
+}
+
+manifest_record() {
+	manifest_forget "$1"
+	mkdir -p "$(dirname "$MANIFEST")"
+	sha256sum "$1" >>"$MANIFEST"
+}
+
 # install_file SRC DEST MODE  - keeps a .bak of a foreign file it replaces
 install_file() {
-	local src="$1" dest="$2" mode="${3:-644}"
+	local src="$1" dest="$2" mode="${3:-644}" ours
 	if [ -e "$dest" ] && ! cmp -s "$src" "$dest" && [ ! -e "$dest.ov32c4.bak" ]; then
-		cp -a "$dest" "$dest.ov32c4.bak"
-		info "kept previous $dest as $dest.ov32c4.bak"
+		ours="$(manifest_hash "$dest")"
+		if [ -n "$ours" ] && [ "$ours" = "$(sha256sum "$dest" | cut -d' ' -f1)" ]; then
+			info "updating $dest"
+		else
+			cp -a "$dest" "$dest.ov32c4.bak"
+			info "kept previous $dest as $dest.ov32c4.bak"
+		fi
 	fi
 	install -D -m "$mode" "$src" "$dest"
+	manifest_record "$dest"
 }
 
 remove_file() {
 	local f="$1"
+	manifest_forget "$f"
 	[ -e "$f" ] || return 0
 	rm -f "$f"
 	info "removed $f"
