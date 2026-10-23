@@ -18,16 +18,34 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 UPSTREAM_URL="https://git.libcamera.org/libcamera/libcamera.git"
 MIRROR_URL="https://github.com/libcamera-org/libcamera.git"
 PIN="35c137c2f3e7104b96702c649344fafc91d8e233"   # see PIN_NOTE below
-PIN_TAG="v0.7.2"
 SRCDIR="${LIBCAMERA_SRC:-$TARGET_HOME/libcamera-ov32c4}"
 BUILDDIR="$SRCDIR/build"
+# Outside the source tree, so that it does not show up in git status there.
+LOG="$SRCDIR.build.log"
 PREFIX=/usr/local
 PATCHES="$REPO/upstream/libcamera"
 
 # PIN_NOTE: the patches were developed against libcamera master of
-# 2026-08-24 (0.7.2 + a few commits). If the pin no longer applies,
-# LIBCAMERA_REF=<ref> overrides it and `git am` will tell you what broke.
+# 2026-08-24 (0.7.2 + a few commits); they do not apply to the v0.7.2
+# tag itself. LIBCAMERA_REF=<ref> overrides the pin, and `git am` will
+# tell you what broke.
 REF="${LIBCAMERA_REF:-$PIN}"
+
+# git am records a committer, and fails without a name and email. The
+# commits only live in this private tree, so any identity will do; an
+# installer that asks for one would be worse.
+GIT_IDENT=(-c user.name="ov32c4 installer" -c user.email="ov32c4-installer@localhost")
+
+# Run a build command with its output in $LOG; on failure show the end
+# of the log, because meson and ninja say what is wrong on stdout.
+logged() {
+	local what="$1"; shift
+	if ! "$@" >>"$LOG" 2>&1; then
+		warn "$what failed, the last lines of $LOG:"
+		tail -n 25 "$LOG" >&2
+		die "$what failed (full log: $LOG)"
+	fi
+}
 
 install_libcamera() {
 	need_root
@@ -43,8 +61,7 @@ install_libcamera() {
 
 	as_user git -C "$SRCDIR" fetch -q --all || true
 	if ! as_user git -C "$SRCDIR" rev-parse --verify -q "$REF^{commit}" >/dev/null; then
-		warn "pinned commit not found, falling back to tag $PIN_TAG"
-		REF="$PIN_TAG"
+		die "$REF is not a commit in $SRCDIR - check LIBCAMERA_REF, or the network for the fetch"
 	fi
 
 	info "checking out $REF"
@@ -58,22 +75,28 @@ install_libcamera() {
 	done
 	[ ${#patches[@]} -gt 0 ] || die "no patches found in $PATCHES"
 	info "applying ${#patches[@]} patches"
-	if ! as_user git -C "$SRCDIR" am -q "${patches[@]}"; then
-		as_user git -C "$SRCDIR" am --abort || true
+	if ! as_user git -C "$SRCDIR" "${GIT_IDENT[@]}" am -q "${patches[@]}"; then
+		as_user git -C "$SRCDIR" "${GIT_IDENT[@]}" am --abort || true
 		die "the patches do not apply to $REF - set LIBCAMERA_REF to a matching commit"
 	fi
 
-	info "building (this takes a few minutes)"
-	as_user meson setup "$BUILDDIR" "$SRCDIR" \
+	info "building (this takes a few minutes, log: $LOG)"
+	# Created as the user, so that the file in their home is theirs; the
+	# appends below keep that owner.
+	as_user sh -c ': >"$1"' sh "$LOG"
+	# On a second run the build directory exists, and a plain "meson
+	# setup" would leave the options it was first configured with.
+	reconf=()
+	[ -f "$BUILDDIR/build.ninja" ] && reconf=(--reconfigure)
+	logged "meson setup" as_user meson setup ${reconf[@]+"${reconf[@]}"} "$BUILDDIR" "$SRCDIR" \
 		--prefix="$PREFIX" --buildtype=release \
 		-Dpipelines=simple -Dipas=softisp \
 		-Dsoftisp-gpu=enabled \
 		-Dcam=enabled -Dgstreamer=enabled \
 		-Dqcam=disabled -Dlc-compliance=disabled -Ddocumentation=disabled \
-		-Dtest=false -Dpycamera=disabled -Dv4l2=disabled \
-		>/dev/null
-	as_user ninja -C "$BUILDDIR" >/dev/null
-	ninja -C "$BUILDDIR" install >/dev/null
+		-Dtest=false -Dpycamera=disabled -Dv4l2=disabled
+	logged "build" as_user ninja -C "$BUILDDIR"
+	logged "install" ninja -C "$BUILDDIR" install
 	ldconfig
 	ok "libcamera $(pkg-config --modversion libcamera 2>/dev/null || echo installed) in $PREFIX"
 	info "GStreamer plugin: $(ls "$PREFIX"/lib/*/gstreamer-1.0/libgstlibcamera.so 2>/dev/null | head -1)"

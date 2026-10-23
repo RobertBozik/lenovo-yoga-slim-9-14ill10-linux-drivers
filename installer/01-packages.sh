@@ -15,6 +15,8 @@ BUILD_PKGS=(
 LIBCAMERA_PKGS=(
 	libyaml-dev libgnutls28-dev libegl-dev libgles-dev libgbm-dev
 	libdrm-dev libudev-dev libevent-dev
+	# -Dgstreamer=enabled: the libcamerasrc element the feeder uses.
+	libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 	python3-jinja2 python3-ply python3-yaml python3-dev
 )
 RUNTIME_PKGS=(
