@@ -6,8 +6,8 @@
 # Both modules land in /lib/modules/<kernel>/updates/dkms/, which depmod
 # prefers over the distribution ones, and DKMS rebuilds them for every new
 # kernel. The sensor driver is ours (upstream submission in upstream/);
-# ipu-bridge is the kernel's own file with one line added, see
-# vendor/ipu-bridge/README.md.
+# ipu-bridge is the kernel's own file with the sensor entry and a VCM
+# exception added, see vendor/ipu-bridge/README.md.
 #
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
