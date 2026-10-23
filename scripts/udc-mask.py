@@ -153,12 +153,27 @@ def panel_size_mm():
     return None
 
 
+def panel_screen():
+    """The laptop's own panel, which need not be the primary screen.
+
+    With an external monitor set as primary, or placed to the left of the
+    panel, the primary screen is the wrong one to put the dot on.  The
+    built-in panel is the eDP output; if no screen says so, fall back to
+    the primary one.
+    """
+    for scr in QApplication.screens():
+        if scr.name().startswith("eDP"):
+            return scr
+    return QApplication.primaryScreen()
+
+
 def geometry_px(cfg):
-    """(x, y, d) of the dot in pixels of the current screen, from the mm."""
-    scr = QApplication.primaryScreen().geometry()
+    """(x, y, d) of the dot in pixels, relative to the panel's top left."""
+    screen = panel_screen()
+    scr = screen.geometry()
     size = panel_size_mm()
     if size is None:
-        phys = QApplication.primaryScreen().physicalSize()
+        phys = screen.physicalSize()
         size = (phys.width(), phys.height())
         print("no EDID found, using Qt's physical size (may be wrong): %s" % (size,))
     w_mm, h_mm = size
@@ -280,8 +295,11 @@ class Mask(QWidget):
         # No setMask(): a QRegion mask has jagged edges, there is no
         # antialiasing.  The window is transparent instead and the circle
         # is drawn smooth in paintEvent.
+        # setGeometry() is in desktop coordinates, so add where the panel
+        # sits on the desktop.
         x, y, d = geometry_px(cfg)
-        self.setGeometry(x, y, d, d)
+        origin = panel_screen().geometry().topLeft()
+        self.setGeometry(origin.x() + x, origin.y() + y, d, d)
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -304,6 +322,9 @@ class Calibrator(QWidget):
         self.cfg = dict(DEFAULT)
         self.cfg.update({k: cfg[k] for k in ("dx_mm", "dy_mm", "d_mm") if k in cfg})
         self.setWindowTitle("udc-mask calibration")
+        # Full screen on the panel, where the dot is drawn in its own
+        # coordinates, not on whichever screen the window opens on.
+        self.setGeometry(panel_screen().geometry())
         self.showFullScreen()
 
     def keyPressEvent(self, e):
@@ -374,7 +395,7 @@ def run_daemon(cfg):
     app = QApplication(sys.argv)
     mask = Mask(cfg)
     state = {"on": False, "display": display_stamp(), "changed_at": None}
-    app.primaryScreen().geometryChanged.connect(lambda _: mask.apply(cfg))
+    panel_screen().geometryChanged.connect(lambda _: mask.apply(cfg))
 
     def tick():
         stamp = display_stamp()
