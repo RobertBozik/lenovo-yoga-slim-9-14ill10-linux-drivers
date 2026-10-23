@@ -34,7 +34,8 @@ install)
 
 	install_file "$REPO/scripts/udc-mask.py" "$BIN" 755
 
-	cat >/tmp/udc-mask.service <<EOF
+	tmp="$(mktemp)"
+	cat >"$tmp" <<EOF
 [Unit]
 Description=Black mask over the under-display camera lens
 PartOf=graphical-session.target
@@ -49,8 +50,8 @@ RestartSec=5
 [Install]
 WantedBy=graphical-session.target
 EOF
-	install_file /tmp/udc-mask.service "$UNIT"
-	rm -f /tmp/udc-mask.service
+	install_file "$tmp" "$UNIT"
+	rm -f "$tmp"
 
 	user_systemctl daemon-reload
 	user_systemctl enable --now udc-mask.service

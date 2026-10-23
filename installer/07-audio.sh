@@ -30,9 +30,10 @@ install)
 			warn "(checked snd_sof_intel_hda_generic and snd_sof_intel_hda_common)"
 		fi
 	fi
-	printf 'options %s hda_model=%s\n' "$mod" "$MODEL" >/tmp/alc287-yoga9.conf
-	install_file /tmp/alc287-yoga9.conf "$CONF"
-	rm -f /tmp/alc287-yoga9.conf
+	tmp="$(mktemp)"
+	printf 'options %s hda_model=%s\n' "$mod" "$MODEL" >"$tmp"
+	install_file "$tmp" "$CONF"
+	rm -f "$tmp"
 	update-initramfs -u >/dev/null 2>&1 || warn "update-initramfs failed"
 	ok "wrote $CONF (module $mod)"
 	info "takes effect after a reboot"
