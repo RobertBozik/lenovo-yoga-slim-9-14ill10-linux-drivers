@@ -19,7 +19,8 @@
 # Windows. Plasma has no default shortcut for it, so in a Plasma session
 # it is made to toggle Night Color - only if Night Color has no shortcut
 # yet and nothing else uses the key, and uninstall takes it out again
-# only if it is still the one set here.
+# only if it is still the one set here. The two star keys are left for
+# the user to assign; until they are, a press opens the shortcut settings.
 #
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 

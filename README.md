@@ -130,7 +130,9 @@ Windows energy saver, power saver also dims the screen by 30 %, and
 leaving it puts the brightness back unless you changed it in between.
 In Plasma the step also makes the eye key toggle Night Color, which is
 what it does under Windows (eye care) - unless Night Color or the key
-already has a shortcut of your own.
+already has a shortcut of your own. The two star keys are yours to
+assign, as under Windows: until they have a shortcut, pressing one
+opens the shortcut settings.
 
 ## The installer
 

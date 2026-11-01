@@ -24,6 +24,12 @@ Like the Windows energy saver, entering low-power also dims the screen
 by DIM, and leaving it puts the brightness back - unless it was changed
 by hand in the meantime, in which case it is left as it is.
 
+Star keys. Under Windows the two star keys (KEY_PROG1 on the right,
+KEY_FAVORITES next to F12) are left for the user to assign. In Plasma a
+press on one that has no global shortcut yet opens the shortcut
+settings, so it is obvious what to do; once a shortcut is assigned,
+Plasma runs it and this service stays out of the way.
+
 The message goes to the Plasma OSD (the volume-change popup) when Plasma
 is running, and to an ordinary desktop notification otherwise.
 """
@@ -42,7 +48,7 @@ BRIGHTNESS = ("org.kde.Solid.PowerManagement",
               "/org/kde/Solid/PowerManagement/Actions/BrightnessControl",
               "org.kde.Solid.PowerManagement.Actions.BrightnessControl")
 
-EV_MSC, MSC_SCAN = 4, 4
+EV_KEY, EV_MSC, MSC_SCAN = 1, 4, 4
 SCAN_CAMERA_ON, SCAN_CAMERA_OFF = 0x10C, 0x10D
 
 # struct input_event: struct timeval, __u16 type, __u16 code, __s32 value
@@ -60,8 +66,19 @@ MESSAGES = {
         "en": "Balanced", "sk": "Vyvážený", "cs": "Vyvážený"}),
     "low-power": ("power-profile-power-saver-symbolic", {
         "en": "Power saver", "sk": "Úspora energie", "cs": "Úspora energie"}),
+    "unassigned": ("input-keyboard", {
+        "en": "No shortcut on this key yet",
+        "sk": "Kláves zatiaľ nemá priradenú skratku",
+        "cs": "Klávesa zatím nemá přiřazenou zkratku"}),
 }
 SCANS = {SCAN_CAMERA_ON: "camera-on", SCAN_CAMERA_OFF: "camera-off"}
+
+# Star keys: evdev key code -> Qt key code, as Plasma stores the shortcut
+# (read back from kglobalaccel after assigning the keys by hand).
+KEY_PROG1, KEY_FAVORITES = 148, 364
+STAR_KEYS = {KEY_PROG1: 16777379,       # Qt::Key_Launch1, "Launch (1)"
+             KEY_FAVORITES: 16777361}   # Qt::Key_Favorites
+KGLOBALACCEL = ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel")
 
 
 def language():
@@ -140,6 +157,21 @@ def show(message):
            "yoga-hotkeys", "0", icon, text, "", "0", "0", "2000")
 
 
+def star_key(qt_key):
+    """A star key was pressed: if nothing uses it, open the settings."""
+    out = busctl_out(*KGLOBALACCEL, "getGlobalShortcutsByKey", "i", str(qt_key))
+    if out is None or not out.startswith("a(ssssssaiai) 0"):
+        return                          # not Plasma, or Plasma runs the shortcut
+    show("unassigned")
+    for cmd in (["systemsettings", "kcm_keys"], ["kcmshell6", "kcm_keys"]):
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return
+        except OSError:
+            continue
+
+
 def read_profile(f):
     f.seek(0)
     return f.read().strip()
@@ -179,6 +211,8 @@ def main():
                 _, _, etype, code, value = EVENT.unpack(data)
                 if etype == EV_MSC and code == MSC_SCAN and value in SCANS:
                     show(SCANS[value])
+                elif etype == EV_KEY and value == 1 and code in STAR_KEYS:
+                    star_key(STAR_KEYS[code])
             elif profile is not None and fd == profile.fileno():
                 now = read_profile(profile)
                 if now != last_profile:
