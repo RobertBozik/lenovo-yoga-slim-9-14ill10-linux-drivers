@@ -128,6 +128,9 @@ the firmware, and the service watches
 `/sys/firmware/acpi/platform_profile` (`tools/hotkeys/`). Like the
 Windows energy saver, power saver also dims the screen by 30 %, and
 leaving it puts the brightness back unless you changed it in between.
+In Plasma the step also makes the eye key toggle Night Color, which is
+what it does under Windows (eye care) - unless Night Color or the key
+already has a shortcut of your own.
 
 ## The installer
 
