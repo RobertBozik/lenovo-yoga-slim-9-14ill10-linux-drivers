@@ -23,6 +23,7 @@
 #   audio      speaker routing fixup for the ALC287 codec
 #   graphics   Xe kernel parameters that stop the display from blanking
 #   hotkeys    on-screen messages for the camera switch and the performance key
+#   soundmodes speaker modes Music, Movie, Game from the Windows speaker tuning
 #
 set -euo pipefail
 
@@ -32,7 +33,7 @@ STEPS_DIR="$REPO/installer"
 BOLD=$'\033[1m'; OFF=$'\033[0m'
 [ -t 1 ] || { BOLD=""; OFF=""; }
 
-ALL_STEPS=(packages driver libcamera tuning loopback mask audio graphics hotkeys)
+ALL_STEPS=(packages driver libcamera tuning loopback mask audio graphics hotkeys soundmodes)
 
 usage() {
 	cat <<EOF

@@ -23,6 +23,9 @@ RUNTIME_PKGS=(
 	v4l2loopback-dkms v4l2loopback-utils v4l-utils
 	gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
 	python3-pyqt6
+	# soundmodes: the LSP plugins as LV2, and PipeWire's LV2 support,
+	# which Ubuntu ships apart from the other filter-graph plugins.
+	lsp-plugins-lv2 libspa-0.2-modules-extra
 )
 
 case "$ACTION" in

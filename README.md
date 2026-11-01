@@ -134,9 +134,21 @@ already has a shortcut of your own. The two star keys are yours to
 assign, as under Windows: until they have a shortcut, pressing one
 opens the shortcut settings.
 
+**Sound modes for the speakers.** Under Windows the speakers get a
+correction tuned for this machine and three modes - Music, Movie, Game -
+on the key with the speaker and the gear. The tuning is data in the
+Windows driver; converted into PipeWire filter chains, it gives the
+speakers the same correction, EQ and dynamics (the vendor's surround
+virtualizer is closed and not part of it). The modes sit in front of
+the speakers, one at a time (Music to start with); the speakers stay
+the output, so the volume keys work on them as always, and the key
+only switches the mode and names it on screen. The modes themselves
+stay at 100 %. On headphones, HDMI or Bluetooth the modes stay out of
+the way. Where the numbers come from is in `tools/soundmodes/README.md`.
+
 ## The installer
 
-Nine independent steps. Each one can install, uninstall and check
+Ten independent steps. Each one can install, uninstall and check
 itself, and can be run again at any time.
 
 ```sh
@@ -159,6 +171,7 @@ sudo bash uninstall.sh                # put the machine back
 | `audio` | the ALC287 speaker routing fixup |
 | `graphics` | the Xe kernel parameters |
 | `hotkeys` | on-screen messages for the camera switch and the performance key |
+| `soundmodes` | speaker modes Music, Movie and Game from the Windows speaker tuning |
 
 The `libcamera` step clones libcamera, checks out the commit the patches
 were made against, applies them and builds into `/usr/local`. It takes

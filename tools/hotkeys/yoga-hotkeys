@@ -30,14 +30,28 @@ press on one that has no global shortcut yet opens the shortcut
 settings, so it is obvious what to do; once a shortcut is assigned,
 Plasma runs it and this service stays out of the way.
 
+Sound mode key. Under Windows the key with the speaker and the gear
+(KEY_PROG2) cycles the speaker modes Music, Movie and Game. The
+soundmodes step installs them as WirePlumber smart filters in front of
+the speakers, one enabled at a time. The speakers stay the output, so
+the volume keys keep working on them and the modes stay at 100 %; the
+key only enables the next filter (through WirePlumber's "filters"
+metadata) and names it in the OSD. The mode is remembered and enabled
+again when the service starts. When the output is not the speakers
+(headphones, HDMI, Bluetooth) the modes do not apply, and the message
+says so.
+
 The message goes to the Plasma OSD (the volume-change popup) when Plasma
-is running, and to an ordinary desktop notification otherwise.
+is running, and to an ordinary desktop notification otherwise. It is
+in the session's language where there is a translation, else English.
 """
+import json
 import os
 import select
 import struct
 import subprocess
 import sys
+import time
 
 KEYS_DEV = "/dev/input/yoga-hotkeys"
 PROFILE = "/sys/firmware/acpi/platform_profile"
@@ -57,19 +71,34 @@ EVENT = struct.Struct("llHHi")
 # message id -> (icon, {language: text})
 MESSAGES = {
     "camera-on": ("camera-on", {
-        "en": "Camera on", "sk": "Kamera zapnutá", "cs": "Kamera zapnuta"}),
+        "en": "Camera on", "sk": "Kamera zapnutá", "cs": "Kamera zapnuta",
+        "de": "Kamera an"}),
     "camera-off": ("camera-off", {
-        "en": "Camera off", "sk": "Kamera vypnutá", "cs": "Kamera vypnuta"}),
+        "en": "Camera off", "sk": "Kamera vypnutá", "cs": "Kamera vypnuta",
+        "de": "Kamera aus"}),
     "performance": ("power-profile-performance-symbolic", {
-        "en": "Performance", "sk": "Výkon", "cs": "Výkon"}),
+        "en": "Performance", "sk": "Výkon", "cs": "Výkon", "de": "Leistung"}),
     "balanced": ("power-profile-balanced-symbolic", {
-        "en": "Balanced", "sk": "Vyvážený", "cs": "Vyvážený"}),
+        "en": "Balanced", "sk": "Vyvážený", "cs": "Vyvážený", "de": "Ausgeglichen"}),
     "low-power": ("power-profile-power-saver-symbolic", {
-        "en": "Power saver", "sk": "Úspora energie", "cs": "Úspora energie"}),
+        "en": "Power saver", "sk": "Úspora energie", "cs": "Úspora energie",
+        "de": "Energiesparen"}),
     "unassigned": ("input-keyboard", {
         "en": "No shortcut on this key yet",
         "sk": "Kláves zatiaľ nemá priradenú skratku",
-        "cs": "Klávesa zatím nemá přiřazenou zkratku"}),
+        "cs": "Klávesa zatím nemá přiřazenou zkratku",
+        "de": "Diese Taste hat noch kein Tastenkürzel"}),
+    "music": ("emblem-music-symbolic", {
+        "en": "Music", "sk": "Hudba", "cs": "Hudba", "de": "Musik"}),
+    "movie": ("video-x-generic-symbolic", {
+        "en": "Movie", "sk": "Film", "cs": "Film", "de": "Film"}),
+    "game": ("input-gaming-symbolic", {
+        "en": "Game", "sk": "Hra", "cs": "Hra", "de": "Spiel"}),
+    "speakers-only": ("audio-speakers-symbolic", {
+        "en": "Sound modes apply to the speakers only",
+        "sk": "Zvukové režimy platia len pre reproduktory",
+        "cs": "Zvukové režimy platí jen pro reproduktory",
+        "de": "Klangmodi gelten nur für die Lautsprecher"}),
 }
 SCANS = {SCAN_CAMERA_ON: "camera-on", SCAN_CAMERA_OFF: "camera-off"}
 
@@ -79,6 +108,16 @@ KEY_PROG1, KEY_FAVORITES = 148, 364
 STAR_KEYS = {KEY_PROG1: 16777379,       # Qt::Key_Launch1, "Launch (1)"
              KEY_FAVORITES: 16777361}   # Qt::Key_Favorites
 KGLOBALACCEL = ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel")
+
+# Sound mode key and the filters the soundmodes step installs.
+KEY_PROG2 = 149
+SPEAKER = "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink"
+SOUND_MODES = ("music", "movie", "game")
+MODE_SINK = "effect_input.yoga_soundmode_%s"
+MODE_CONF = "/etc/pipewire/pipewire.conf.d/90-yoga-soundmode-music.conf"
+MODE_STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or
+                          os.path.expanduser("~/.local/state"),
+                          "yoga-hotkeys", "soundmode")
 
 
 def language():
@@ -172,6 +211,97 @@ def star_key(qt_key):
             continue
 
 
+def run_out(*cmd):
+    """Output of a command, or None if it failed."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def pw_nodes():
+    """node.name -> id for every PipeWire node, or None without PipeWire."""
+    try:
+        objects = json.loads(run_out("pw-dump") or "")
+    except ValueError:
+        return None
+    nodes = {}
+    for o in objects:
+        if o.get("type") == "PipeWire:Interface:Node":
+            name = ((o.get("info") or {}).get("props") or {}).get("node.name")
+            if name:
+                nodes[name] = o["id"]
+    return nodes
+
+
+def default_sink():
+    for line in (run_out("wpctl", "inspect", "@DEFAULT_AUDIO_SINK@") or "").splitlines():
+        line = line.strip().lstrip("* ")
+        if line.startswith("node.name = "):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+def saved_mode():
+    try:
+        with open(MODE_STATE) as f:
+            mode = f.read().strip()
+    except OSError:
+        return SOUND_MODES[0]
+    return mode if mode in SOUND_MODES else SOUND_MODES[0]
+
+
+def save_mode(mode):
+    try:
+        os.makedirs(os.path.dirname(MODE_STATE), exist_ok=True)
+        with open(MODE_STATE, "w") as f:
+            f.write(mode + "\n")
+    except OSError:
+        pass
+
+
+def enable_mode(mode, nodes):
+    """Enable one mode's filter and disable the others. Volumes are not
+    touched. The new one is enabled first, so there is no gap with no
+    mode at all."""
+    present = [m for m in SOUND_MODES if MODE_SINK % m in nodes]
+    for m in sorted(present, key=lambda m: m != mode):
+        run_out("pw-metadata", "-n", "filters", str(nodes[MODE_SINK % m]),
+                "filter.smart.disabled", "false" if m == mode else "true",
+                "Spa:String:JSON")
+
+
+def restore_mode():
+    """At start: enable the remembered mode once the filters are up."""
+    if not os.path.exists(MODE_CONF):
+        return                          # the soundmodes step is not installed
+    for _ in range(20):
+        nodes = pw_nodes()
+        if nodes and all(MODE_SINK % m in nodes for m in SOUND_MODES):
+            enable_mode(saved_mode(), nodes)
+            return
+        time.sleep(1)
+
+
+def sound_mode_key():
+    """The sound mode key: enable the next speaker mode and name it."""
+    nodes = pw_nodes()
+    if nodes is None:
+        return
+    modes = [m for m in SOUND_MODES if MODE_SINK % m in nodes]
+    if not modes:
+        return                          # the soundmodes step is not installed
+    if default_sink() != SPEAKER:
+        show("speakers-only")
+        return
+    cur = saved_mode()
+    nxt = modes[(modes.index(cur) + 1) % len(modes)] if cur in modes else modes[0]
+    enable_mode(nxt, nodes)
+    save_mode(nxt)
+    show(nxt)
+
+
 def read_profile(f):
     f.seek(0)
     return f.read().strip()
@@ -201,6 +331,8 @@ def main():
     if keys is None and profile is None:
         return 1
 
+    restore_mode()
+
     while True:
         for fd, _ in poller.poll():
             if keys is not None and fd == keys.fileno():
@@ -213,6 +345,8 @@ def main():
                     show(SCANS[value])
                 elif etype == EV_KEY and value == 1 and code in STAR_KEYS:
                     star_key(STAR_KEYS[code])
+                elif etype == EV_KEY and value == 1 and code == KEY_PROG2:
+                    sound_mode_key()
             elif profile is not None and fd == profile.fileno():
                 now = read_profile(profile)
                 if now != last_profile:
