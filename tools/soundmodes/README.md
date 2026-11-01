@@ -27,7 +27,8 @@ Each mode is a WirePlumber smart filter in front of the speaker sink
 and WirePlumber routes whatever plays on them through the filter that is
 enabled. Music is enabled by default, Movie and Game are not; the sound
 mode key enables the next one through WirePlumber's `filters` metadata
-(`filter.smart.disabled`) and the hotkeys service remembers it. The
+(`filter.smart.disabled`) and the hotkeys service remembers it. After
+Game comes Neutral, which disables all three: the speakers unprocessed. The
 volume stays on the speakers, so the volume keys work as without the
 modes; the filters stay at 100 %. Plasma lists them as virtual devices,
 named "Speakers: Music" and so on in the session's language (Slovak,

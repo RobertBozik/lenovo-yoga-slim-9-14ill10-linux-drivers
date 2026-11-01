@@ -142,7 +142,8 @@ speakers the same correction, EQ and dynamics (the vendor's surround
 virtualizer is closed and not part of it). The modes sit in front of
 the speakers, one at a time (Music to start with); the speakers stay
 the output, so the volume keys work on them as always, and the key
-only switches the mode and names it on screen. The modes themselves
+only switches the mode and names it on screen. A fourth mode, Neutral,
+switches all of it off: the speakers with no correction and a flat EQ. The modes themselves
 stay at 100 %. On headphones, HDMI or Bluetooth the modes stay out of
 the way. Where the numbers come from is in `tools/soundmodes/README.md`.
 

@@ -33,7 +33,8 @@ Plasma runs it and this service stays out of the way.
 Sound mode key. Under Windows the key with the speaker and the gear
 (KEY_PROG2) cycles the speaker modes Music, Movie and Game. The
 soundmodes step installs them as WirePlumber smart filters in front of
-the speakers, one enabled at a time. The speakers stay the output, so
+the speakers, one enabled at a time. A fourth mode, Neutral, has every
+filter off: the speakers as they are, with no correction or EQ. The speakers stay the output, so
 the volume keys keep working on them and the modes stay at 100 %; the
 key only enables the next filter (through WirePlumber's "filters"
 metadata) and names it in the OSD. The mode is remembered and enabled
@@ -94,6 +95,8 @@ MESSAGES = {
         "en": "Movie", "sk": "Film", "cs": "Film", "de": "Film"}),
     "game": ("input-gaming-symbolic", {
         "en": "Game", "sk": "Hra", "cs": "Hra", "de": "Spiel"}),
+    "neutral": ("audio-speakers-symbolic", {
+        "en": "Neutral", "sk": "Neutrálny", "cs": "Neutrální", "de": "Neutral"}),
     "speakers-only": ("audio-speakers-symbolic", {
         "en": "Sound modes apply to the speakers only",
         "sk": "Zvukové režimy platia len pre reproduktory",
@@ -112,7 +115,8 @@ KGLOBALACCEL = ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel")
 # Sound mode key and the filters the soundmodes step installs.
 KEY_PROG2 = 149
 SPEAKER = "alsa_output.pci-0000_00_1f.3-platform-skl_hda_dsp_generic.HiFi__Speaker__sink"
-SOUND_MODES = ("music", "movie", "game")
+SOUND_MODES = ("music", "movie", "game", "neutral")
+FILTER_MODES = ("music", "movie", "game")  # neutral: no filter at all
 MODE_SINK = "effect_input.yoga_soundmode_%s"
 MODE_CONF = "/etc/pipewire/pipewire.conf.d/90-yoga-soundmode-music.conf"
 MODE_STATE = os.path.join(os.environ.get("XDG_STATE_HOME") or
@@ -262,10 +266,10 @@ def save_mode(mode):
 
 
 def enable_mode(mode, nodes):
-    """Enable one mode's filter and disable the others. Volumes are not
-    touched. The new one is enabled first, so there is no gap with no
-    mode at all."""
-    present = [m for m in SOUND_MODES if MODE_SINK % m in nodes]
+    """Enable one mode's filter and disable the others (all of them for
+    neutral). Volumes are not touched. The new one is enabled first, so
+    there is no gap with no mode at all."""
+    present = [m for m in FILTER_MODES if MODE_SINK % m in nodes]
     for m in sorted(present, key=lambda m: m != mode):
         run_out("pw-metadata", "-n", "filters", str(nodes[MODE_SINK % m]),
                 "filter.smart.disabled", "false" if m == mode else "true",
@@ -278,7 +282,7 @@ def restore_mode():
         return                          # the soundmodes step is not installed
     for _ in range(20):
         nodes = pw_nodes()
-        if nodes and all(MODE_SINK % m in nodes for m in SOUND_MODES):
+        if nodes and all(MODE_SINK % m in nodes for m in FILTER_MODES):
             enable_mode(saved_mode(), nodes)
             return
         time.sleep(1)
@@ -289,9 +293,10 @@ def sound_mode_key():
     nodes = pw_nodes()
     if nodes is None:
         return
-    modes = [m for m in SOUND_MODES if MODE_SINK % m in nodes]
+    modes = [m for m in FILTER_MODES if MODE_SINK % m in nodes]
     if not modes:
         return                          # the soundmodes step is not installed
+    modes.append("neutral")
     if default_sink() != SPEAKER:
         show("speakers-only")
         return
