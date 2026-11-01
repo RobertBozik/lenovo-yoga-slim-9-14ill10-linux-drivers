@@ -114,9 +114,18 @@ is only what one pair of ears preferred.
 disabled for the Xe driver through the kernel command line. The cost is a
 little more power when the screen is idle.
 
+**A message when the camera switch is flipped.** The hardware switch
+cuts the picture without any error, so the camera just looks broken.
+Like Windows, the installer shows an on-screen message ("Camera off" /
+"Camera on") when the switch moves: the Plasma OSD, or a notification
+on other desktops. The embedded controller reports the switch on
+"Ideapad extra buttons" as scan codes `0x10c` / `0x10d`, which
+`ideapad-laptop` does not map to any key yet, so a small session
+service reads them from the device (`tools/camera-switch/`).
+
 ## The installer
 
-Eight independent steps. Each one can install, uninstall and check
+Nine independent steps. Each one can install, uninstall and check
 itself, and can be run again at any time.
 
 ```sh
@@ -138,6 +147,7 @@ sudo bash uninstall.sh                # put the machine back
 | `mask` | the black dot over the lens |
 | `audio` | the ALC287 speaker routing fixup |
 | `graphics` | the Xe kernel parameters |
+| `camswitch` | the on-screen message for the camera switch |
 
 The `libcamera` step clones libcamera, checks out the commit the patches
 were made against, applies them and builds into `/usr/local`. It takes
@@ -224,7 +234,8 @@ a directory of files GRUB would have to load.
   reports streaming, the privacy LED lights, CSI-2 packets arrive and the
   ISYS hands over frames — every sample in them is zero, at any exposure
   and gain. Nothing in `dmesg` or libcamera says a word. Flip the switch
-  before debugging anything else.
+  before debugging anything else; with the `camswitch` step installed,
+  the on-screen message says which way it went.
 * **In very low light the picture is noisy** and can pick up a colour
   cast. At that point the ISP is running at high digital gain and the
   sensor is small; this is the limit of the hardware more than of the
