@@ -1,12 +1,11 @@
 [Unit]
-Description=On-screen message for the hardware camera switch
+Description=On-screen messages for the camera switch and the performance key
 PartOf=graphical-session.target
 After=graphical-session.target
-ConditionPathExists=/dev/input/yoga-camera-switch
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/camera-switch-osd
+ExecStart=/usr/local/bin/yoga-hotkeys
 Restart=on-failure
 RestartSec=5
 

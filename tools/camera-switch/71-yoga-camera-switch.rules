@@ -1,8 +1,0 @@
-# SPDX-License-Identifier: GPL-2.0
-# Lenovo Yoga Slim 9 14ILL10 (83CX): the hardware camera switch arrives on
-# "Ideapad extra buttons" as scan codes 0x10c (on) / 0x10d (off). Give the
-# logged-in user read access, so that the session service camera-switch-osd
-# can show a message, and a stable name for it. The device carries only
-# the laptop's Fn hotkeys, not typed text. Numbered below 73, where
-# systemd turns the uaccess tag into an ACL.
-SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Ideapad extra buttons", ATTR{[dmi/id]product_name}=="83CX", TAG+="uaccess", SYMLINK+="input/yoga-camera-switch"
