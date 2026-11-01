@@ -32,7 +32,7 @@ TEXT = {
     "sk": ("Kamera zapnutá", "Kamera vypnutá"),
     "cs": ("Kamera zapnuta", "Kamera vypnuta"),
 }
-ICON = {SCAN_ON: "camera-web", SCAN_OFF: "camera-off"}
+ICON = {SCAN_ON: "camera-on", SCAN_OFF: "camera-off"}
 
 # struct input_event: struct timeval, __u16 type, __u16 code, __s32 value
 EVENT = struct.Struct("llHHi")
