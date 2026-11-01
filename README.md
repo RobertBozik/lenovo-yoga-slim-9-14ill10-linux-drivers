@@ -125,7 +125,9 @@ switch on "Ideapad extra buttons" as scan codes `0x10c` / `0x10d`,
 which `ideapad-laptop` does not map to any key yet, so a small session
 service reads them from the device; the performance key is cycled by
 the firmware, and the service watches
-`/sys/firmware/acpi/platform_profile` (`tools/hotkeys/`).
+`/sys/firmware/acpi/platform_profile` (`tools/hotkeys/`). Like the
+Windows energy saver, power saver also dims the screen by 30 %, and
+leaving it puts the brightness back unless you changed it in between.
 
 ## The installer
 

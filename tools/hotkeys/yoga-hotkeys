@@ -20,6 +20,9 @@ Performance key. The firmware cycles the platform profile itself
 does notify sysfs readers of /sys/firmware/acpi/platform_profile, so a
 change shows up as an exceptional condition on poll(). A change made
 anywhere else, e.g. in the Plasma battery applet, is shown as well.
+Like the Windows energy saver, entering low-power also dims the screen
+by DIM, and leaving it puts the brightness back - unless it was changed
+by hand in the meantime, in which case it is left as it is.
 
 The message goes to the Plasma OSD (the volume-change popup) when Plasma
 is running, and to an ordinary desktop notification otherwise.
@@ -32,6 +35,12 @@ import sys
 
 KEYS_DEV = "/dev/input/yoga-hotkeys"
 PROFILE = "/sys/firmware/acpi/platform_profile"
+
+# How much darker the screen gets in low-power (Windows uses 30 %).
+DIM = 0.30
+BRIGHTNESS = ("org.kde.Solid.PowerManagement",
+              "/org/kde/Solid/PowerManagement/Actions/BrightnessControl",
+              "org.kde.Solid.PowerManagement.Actions.BrightnessControl")
 
 EV_MSC, MSC_SCAN = 4, 4
 SCAN_CAMERA_ON, SCAN_CAMERA_OFF = 0x10C, 0x10D
@@ -63,13 +72,60 @@ def language():
     return "en"
 
 
-def busctl(*args):
+def busctl_out(*args):
+    """Output of a busctl call, or None if it failed."""
     try:
-        return subprocess.run(["busctl", "--user", "call", *args],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=5).returncode == 0
+        r = subprocess.run(["busctl", "--user", "call", *args],
+                           capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired):
-        return False
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def busctl(*args):
+    return busctl_out(*args) is not None
+
+
+def brightness_get(method):
+    """An integer from Plasma's brightness control ("i 1234"), or None."""
+    out = busctl_out(*BRIGHTNESS, method)
+    try:
+        return int(out.split()[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def brightness_set(value):
+    # Silent: the power mode message is already on screen.
+    busctl(*BRIGHTNESS, "setBrightnessSilent", "i", str(value))
+
+
+class Dimmer:
+    """Dims the screen in low-power and undoes it afterwards."""
+
+    def __init__(self):
+        self.saved = self.dimmed_to = None
+
+    def enter(self):
+        now = brightness_get("brightness")
+        if now is None:
+            return                      # not Plasma: leave the screen alone
+        floor = brightness_get("knownSafeBrightnessMin") or 1
+        target = max(floor, round(now * (1 - DIM)))
+        if target >= now:
+            return
+        brightness_set(target)
+        self.saved, self.dimmed_to = now, target
+
+    def leave(self):
+        if self.saved is None:
+            return
+        now = brightness_get("brightness")
+        top = brightness_get("brightnessMax") or 100
+        # Put it back only if nobody touched it; allow 1 % for rounding.
+        if now is not None and abs(now - self.dimmed_to) <= max(1, top // 100):
+            brightness_set(self.saved)
+        self.saved = self.dimmed_to = None
 
 
 def show(message):
@@ -93,6 +149,7 @@ def main():
     poller = select.poll()
     keys = profile = None
     last_profile = None
+    dimmer = Dimmer()
 
     try:
         keys = open(KEYS_DEV, "rb", buffering=0)
@@ -124,8 +181,13 @@ def main():
                     show(SCANS[value])
             elif profile is not None and fd == profile.fileno():
                 now = read_profile(profile)
-                if now != last_profile and now in MESSAGES:
-                    show(now)
+                if now != last_profile:
+                    if now in MESSAGES:
+                        show(now)
+                    if now == "low-power":
+                        dimmer.enter()
+                    elif last_profile == "low-power":
+                        dimmer.leave()
                 last_profile = now
 
 
