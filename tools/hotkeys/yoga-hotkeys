@@ -91,9 +91,9 @@ MESSAGES = {
         "de": "Diese Taste hat noch kein Tastenkürzel"}),
     "music": ("emblem-music-symbolic", {
         "en": "Music", "sk": "Hudba", "cs": "Hudba", "de": "Musik"}),
-    "movie": ("video-x-generic-symbolic", {
+    "movie": ("video-symbolic", {
         "en": "Movie", "sk": "Film", "cs": "Film", "de": "Film"}),
-    "game": ("input-gaming-symbolic", {
+    "game": ("input-gamepad-symbolic", {
         "en": "Game", "sk": "Hra", "cs": "Hra", "de": "Spiel"}),
     "neutral": ("audio-speakers-symbolic", {
         "en": "Neutral", "sk": "Neutrálny", "cs": "Neutrální", "de": "Neutral"}),
