@@ -32,6 +32,7 @@ repository.
 | Camera | **OmniVision OV32C4**, ACPI `OVTI32C4`, under the OLED panel |
 | Audio codec | Realtek **ALC287**, driven through SOF |
 | Developed and tested on | Kubuntu 26.04, kernel 7.0.0-30-generic |
+| Also tested on | Fedora 45 Workstation (GNOME 51), kernel 7.2.15-300.fc45 |
 
 Other Lunar Lake laptops with the same sensor may work; the installer
 warns if the DMI strings do not match and lets you continue anyway.
@@ -149,6 +150,12 @@ the way. Where the numbers come from is in `tools/soundmodes/README.md`.
 
 ## The installer
 
+It supports **Kubuntu** (Plasma) and **Fedora Workstation** (GNOME) and
+detects which one it runs on; where the two need different settings, each
+gets its own (see [Fedora (GNOME)](#fedora-gnome)). Other combinations -
+Ubuntu with GNOME, Fedora with Plasma - are not done yet, and the
+installer says so instead of guessing.
+
 Ten independent steps. Each one can install, uninstall and check
 itself, and can be run again at any time.
 
@@ -183,6 +190,46 @@ libcamera back.
 A file that was already there and is not ours is kept as
 `<name>.ov32c4.bak` and put back on uninstall.
 
+## Fedora (GNOME)
+
+The same steps, with these differences:
+
+* **Packages** come from dnf. `v4l2loopback` is not in Fedora; the
+  `packages` step adds the **RPM Fusion Free** repository and installs it
+  from there as an akmod.
+* **Two module keys to enroll with Secure Boot.** Fedora's DKMS (the camera
+  driver) and akmods (`v4l2loopback`) each sign with a key of their own.
+  The installer creates the akmods key, which Fedora does not do by
+  itself, and queues each key for enrolment with a one-time password; at
+  the next boot MokManager comes up - *Enroll MOK* → *Continue* → *Yes* →
+  the password. The camera works once both are enrolled; if `sudo bash
+  install.sh --check` still finds the driver or `/dev/video42` missing
+  after that, run `--step packages --step driver` again and reboot once
+  more.
+* **libcamera** lands in `/usr/local/lib64`, which Fedora searches neither
+  for libraries nor for GStreamer plugins, so the step adds
+  `/etc/ld.so.conf.d/libcamera-ov32c4.conf` and
+  `/etc/environment.d/90-libcamera-ov32c4.conf`.
+* **GNOME applications get the camera through the loopback**, not straight
+  from libcamera. GNOME applications use the camera only through PipeWire,
+  and straight from libcamera at the sizes they ask for (1920x1080 and
+  less) the GPU debayer scales without averaging, which leaves colour
+  streaks along moving edges. The feeder takes the full resolution and
+  scales on the CPU, which is clean. The WirePlumber rule is therefore the
+  opposite of Kubuntu's: libcamera hidden, the loopback offered.
+* **The mask and the messages come from a GNOME Shell extension**
+  (`tools/gnome-extension/`). GNOME keeps every window, even an
+  always-on-top one, under its own UI - the screenshot tool, the overview -
+  so the dot is drawn by the Shell itself, above everything. The same
+  extension shows the hotkey messages as the usual GNOME bubble (GNOME's
+  own OSD call is closed to other programs) and lets the hotkeys service
+  dim the screen silently in power-saver mode. GNOME loads a new extension
+  at the next login.
+* **Keys:** the eye key toggles **Night Light**; an unassigned star key
+  opens the keyboard settings (*Settings → Keyboard*).
+* **audio** rebuilds the initramfs with dracut; **graphics** adds the
+  kernel parameters with `grubby`.
+
 ## Secure Boot
 
 Everything here runs with Secure Boot enabled, so a dual-boot machine
@@ -203,8 +250,8 @@ sudo efi-readvar -v db | grep CN=
 sudo sbverify --list /boot/efi/EFI/ubuntu/shimx64.efi | grep CN=
 ```
 
-The fix is one setting: **F2 → Security → Secure Boot → `Allow Microsoft
-3rd Party UEFI CA` = Enabled**, which adds that certificate to `db`, then
+The same applies to Fedora's shim. The fix is one setting: **F2 → Security
+→ Secure Boot → `Allow Microsoft 3rd Party UEFI CA` = Enabled**, which adds that certificate to `db`, then
 `Secure Boot = Enabled`. The same menu offers `Reset to Setup Mode` and
 `Restore Factory Keys` if you ever need to write `db` by hand.
 

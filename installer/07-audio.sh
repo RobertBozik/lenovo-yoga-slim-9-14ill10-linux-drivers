@@ -16,6 +16,16 @@
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 CONF=/etc/modprobe.d/alc287-yoga9.conf
+
+# The initramfs carries modprobe.d along; Ubuntu rebuilds it with
+# update-initramfs, Fedora with dracut.
+rebuild_initramfs() {
+	if command -v update-initramfs >/dev/null 2>&1; then
+		update-initramfs -u >/dev/null 2>&1
+	else
+		dracut -f >/dev/null 2>&1
+	fi
+}
 MODEL=alc287-yoga9-bass-spk-pin
 
 case "$ACTION" in
@@ -34,7 +44,7 @@ install)
 	printf 'options %s hda_model=%s\n' "$mod" "$MODEL" >"$tmp"
 	install_file "$tmp" "$CONF"
 	rm -f "$tmp"
-	update-initramfs -u >/dev/null 2>&1 || warn "update-initramfs failed"
+	rebuild_initramfs || warn "rebuilding the initramfs failed"
 	ok "wrote $CONF (module $mod)"
 	info "takes effect after a reboot"
 	;;
@@ -42,7 +52,7 @@ install)
 uninstall)
 	need_root
 	remove_file "$CONF"
-	update-initramfs -u >/dev/null 2>&1 || true
+	rebuild_initramfs || true
 	;;
 
 check)

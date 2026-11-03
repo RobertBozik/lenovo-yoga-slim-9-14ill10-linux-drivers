@@ -24,6 +24,48 @@ BUILDDIR="$SRCDIR/build"
 LOG="$SRCDIR.build.log"
 PREFIX=/usr/local
 PATCHES="$REPO/upstream/libcamera"
+# meson puts the libraries into lib/<triplet>/ on Ubuntu and lib64/ on
+# Fedora. Fedora searches neither /usr/local/lib64 for libraries nor
+# its gstreamer-1.0/ for plugins, so there the step tells both.
+LDCONF=/etc/ld.so.conf.d/libcamera-ov32c4.conf
+GSTENV=/etc/environment.d/90-libcamera-ov32c4.conf
+
+# Directory with the installed libcamera.so, empty if none.
+libcamera_libdir() {
+	local so
+	so="$(ls "$PREFIX"/lib/*/libcamera.so.* "$PREFIX"/lib64/libcamera.so.* 2>/dev/null | head -1 || true)"
+	[ -n "$so" ] && dirname "$so"
+	return 0
+}
+
+# Make the dynamic linker and GStreamer find what was installed.
+publish_paths() {
+	local libdir tmp
+	libdir="$(libcamera_libdir)"
+	[ -n "$libdir" ] || return 0
+	ldconfig
+	# grep without -q: quitting early would kill ldconfig with SIGPIPE,
+	# which pipefail reports as a failure.
+	if ! ldconfig -p | grep -F "$libdir/libcamera.so" >/dev/null; then
+		tmp="$(mktemp)"
+		echo "$libdir" >"$tmp"
+		install_file "$tmp" "$LDCONF"
+		rm -f "$tmp"
+		ldconfig
+		info "added $libdir to the library path ($LDCONF)"
+	fi
+	if [ -e "$libdir/gstreamer-1.0/libgstlibcamera.so" ] &&
+		! env -u GST_PLUGIN_PATH gst-inspect-1.0 libcamerasrc >/dev/null 2>&1; then
+		tmp="$(mktemp)"
+		echo "GST_PLUGIN_PATH=$libdir/gstreamer-1.0" >"$tmp"
+		install_file "$tmp" "$GSTENV"
+		rm -f "$tmp"
+		# environment.d applies from the next login; the running session
+		# (and the feeder in it) gets it now.
+		user_systemctl set-environment "GST_PLUGIN_PATH=$libdir/gstreamer-1.0"
+		info "GStreamer plugin path set in $GSTENV"
+	fi
+}
 
 # PIN_NOTE: the patches were developed against libcamera master of
 # 2026-08-24 (0.7.2 + a few commits); they do not apply to the v0.7.2
@@ -97,9 +139,13 @@ install_libcamera() {
 		-Dtest=false -Dpycamera=disabled -Dv4l2=disabled
 	logged "build" as_user ninja -C "$BUILDDIR"
 	logged "install" ninja -C "$BUILDDIR" install
-	ldconfig
-	ok "libcamera $(pkg-config --modversion libcamera 2>/dev/null || echo installed) in $PREFIX"
-	info "GStreamer plugin: $(ls "$PREFIX"/lib/*/gstreamer-1.0/libgstlibcamera.so 2>/dev/null | head -1)"
+	if is_fedora; then
+		publish_paths
+	else
+		ldconfig
+	fi
+	ok "libcamera $(PKG_CONFIG_PATH="$(libcamera_libdir)/pkgconfig" pkg-config --modversion libcamera 2>/dev/null || echo installed) in $PREFIX"
+	info "GStreamer plugin: $(ls "$PREFIX"/lib/*/gstreamer-1.0/libgstlibcamera.so "$PREFIX"/lib64/gstreamer-1.0/libgstlibcamera.so 2>/dev/null | head -1)"
 }
 
 case "$ACTION" in
@@ -111,15 +157,18 @@ uninstall)
 		ninja -C "$BUILDDIR" uninstall >/dev/null 2>&1 || warn "ninja uninstall failed, removing by hand"
 	fi
 	rm -f "$PREFIX"/lib/*/libcamera*.so* "$PREFIX"/lib/*/gstreamer-1.0/libgstlibcamera.so
-	rm -rf "$PREFIX"/lib/*/libcamera "$PREFIX"/share/libcamera "$PREFIX"/include/libcamera
-	rm -f "$PREFIX"/bin/cam "$PREFIX"/lib/*/pkgconfig/libcamera*.pc
+	rm -f "$PREFIX"/lib64/libcamera*.so* "$PREFIX"/lib64/gstreamer-1.0/libgstlibcamera.so
+	rm -rf "$PREFIX"/lib/*/libcamera "$PREFIX"/lib64/libcamera "$PREFIX"/share/libcamera "$PREFIX"/include/libcamera
+	rm -f "$PREFIX"/bin/cam "$PREFIX"/lib/*/pkgconfig/libcamera*.pc "$PREFIX"/lib64/pkgconfig/libcamera*.pc
+	remove_file "$LDCONF"
+	remove_file "$GSTENV"
 	ldconfig
 	ok "removed libcamera from $PREFIX (the distribution one takes over again)"
 	info "the source tree in $SRCDIR is left alone"
 	;;
 
 check)
-	so="$(ls "$PREFIX"/lib/*/libcamera.so.* 2>/dev/null | head -1 || true)"
+	so="$(ls "$PREFIX"/lib/*/libcamera.so.* "$PREFIX"/lib64/libcamera.so.* 2>/dev/null | head -1 || true)"
 	if [ -n "$so" ]; then
 		report libcamera ok "$so"
 	else
@@ -128,7 +177,7 @@ check)
 	fi
 	# meson puts the IPA modules in <libdir>/libcamera/ipa/; older trees
 	# put them straight into <libdir>/libcamera/, so look in both.
-	ipa="$(find "$PREFIX"/lib -name 'ipa_softisp.so' -print -quit 2>/dev/null || true)"
+	ipa="$(find "$PREFIX"/lib "$PREFIX"/lib64 -name 'ipa_softisp.so' -print -quit 2>/dev/null || true)"
 	if [ -n "$ipa" ]; then
 		report "softisp IPA" ok "$ipa"
 	else

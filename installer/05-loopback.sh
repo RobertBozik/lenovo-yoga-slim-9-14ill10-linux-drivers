@@ -10,6 +10,11 @@
 # libcamera whenever something reads from it, and WirePlumber hides the
 # loopback from PipeWire applications so the camera is not offered twice.
 #
+# On GNOME it is the other way round: GNOME applications only use PipeWire,
+# and straight from libcamera they get colour streaks on moving edges (see
+# tools/loopback/50-ov32c4-pipewire-uses-loopback.conf), so PipeWire offers
+# the loopback and libcamera is hidden from it.
+#
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 SRC="$REPO/tools/loopback"
@@ -18,7 +23,22 @@ UNIT=/etc/systemd/user/ov32c4-camera-watch.service
 MODPROBE=/etc/modprobe.d/ov32c4-loopback.conf
 MODLOAD=/etc/modules-load.d/ov32c4-loopback.conf
 UDEV=/etc/udev/rules.d/99-ov32c4-loopback.rules
-WPRULE=/etc/wireplumber/wireplumber.conf.d/50-ov32c4-loopback-hide.conf
+WPDIR=/etc/wireplumber/wireplumber.conf.d
+if is_gnome; then
+	WPNAME=50-ov32c4-pipewire-uses-loopback.conf
+	WPOTHER=50-ov32c4-loopback-hide.conf
+else
+	WPNAME=50-ov32c4-loopback-hide.conf
+	WPOTHER=50-ov32c4-pipewire-uses-loopback.conf
+fi
+WPRULE="$WPDIR/$WPNAME"
+# GStreamer has to find libcamerasrc under sudo as well (step libcamera may
+# have put its plugin directory into environment.d).
+GSTENV=/etc/environment.d/90-libcamera-ov32c4.conf
+if [ -z "${GST_PLUGIN_PATH:-}" ] && [ -r "$GSTENV" ]; then
+	GST_PLUGIN_PATH="$(sed -n 's/^GST_PLUGIN_PATH=//p' "$GSTENV")"
+	export GST_PLUGIN_PATH
+fi
 
 case "$ACTION" in
 install)
@@ -30,7 +50,8 @@ install)
 	install_file "$SRC/ov32c4-loopback-modprobe.conf" "$MODPROBE"
 	install_file "$SRC/ov32c4-loopback-modules-load.conf" "$MODLOAD"
 	install_file "$SRC/99-ov32c4-loopback.rules" "$UDEV"
-	install_file "$SRC/50-ov32c4-loopback-hide.conf" "$WPRULE"
+	remove_file "$WPDIR/$WPOTHER"
+	install_file "$SRC/$WPNAME" "$WPRULE"
 	install_file "$SRC/ov32c4-camera-watch" "$WATCH_BIN" 755
 	install_file "$SRC/ov32c4-camera-watch.service" "$UNIT"
 
@@ -41,11 +62,18 @@ install)
 
 	udevadm control --reload
 	modprobe -r v4l2loopback 2>/dev/null || true
-	modprobe v4l2loopback
-	udevadm settle
-	sleep 1
-	if ! v4l2-ctl -d /dev/video42 --info 2>/dev/null | grep -q 'Video Capture'; then
-		v4l2loopback-ctl set-caps /dev/video42 "YUYV:1280x720@15" || true
+	if modprobe v4l2loopback; then
+		udevadm settle
+		sleep 1
+		if ! v4l2-ctl -d /dev/video42 --info 2>/dev/null | grep -q 'Video Capture'; then
+			v4l2loopback-ctl set-caps /dev/video42 "YUYV:1280x720@15" || true
+		fi
+	elif is_fedora && mokutil --list-new 2>/dev/null | grep -i fingerprint >/dev/null; then
+		# Fedora: akmods built it, but its key waits for MokManager.
+		warn "v4l2loopback does not load yet - its signing key is enrolled at"
+		warn "the next boot (MokManager); /dev/video42 appears after that."
+	else
+		die "modprobe v4l2loopback failed"
 	fi
 
 	user_systemctl daemon-reload
@@ -62,7 +90,8 @@ uninstall)
 	remove_file "$MODPROBE"
 	remove_file "$MODLOAD"
 	remove_file "$UDEV"
-	remove_file "$WPRULE"
+	remove_file "$WPDIR/50-ov32c4-loopback-hide.conf"
+	remove_file "$WPDIR/50-ov32c4-pipewire-uses-loopback.conf"
 	udevadm control --reload || true
 	modprobe -r v4l2loopback 2>/dev/null || true
 	user_systemctl daemon-reload
@@ -78,6 +107,6 @@ check)
 	else
 		report "feeder service" missing "systemctl --user status ov32c4-camera-watch"
 	fi
-	[ -f "$WPRULE" ] && report "wireplumber rule" ok || report "wireplumber rule" missing
+	[ -f "$WPRULE" ] && report "wireplumber rule" ok "$WPNAME" || report "wireplumber rule" missing "$WPNAME"
 	;;
 esac

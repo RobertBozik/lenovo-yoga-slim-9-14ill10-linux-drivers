@@ -1,0 +1,7 @@
+{
+  "uuid": "yoga-slim-9-14ill10@robertbozik.github.io",
+  "name": "Lenovo Yoga Slim 9 14ILL10",
+  "description": "Black dot over the under-display camera while it streams, on-screen messages and silent dimming for the hotkeys service. Installed by lenovo-yoga-slim-9-14ill10-linux-drivers (install.sh --step mask).",
+  "shell-version": ["51"],
+  "url": "https://github.com/RobertBozik/lenovo-yoga-slim-9-14ill10-linux-drivers"
+}

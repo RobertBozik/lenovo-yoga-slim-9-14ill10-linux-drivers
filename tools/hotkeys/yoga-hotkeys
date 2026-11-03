@@ -43,10 +43,19 @@ again when the service starts. When the output is not the speakers
 says so.
 
 The message goes to the Plasma OSD (the volume-change popup) when Plasma
-is running, and to an ordinary desktop notification otherwise. It is
-in the session's language where there is a translation, else English.
+is running, to the same kind of bubble on GNOME through the Shell
+extension in tools/gnome-extension/ (GNOME's own OSD call is closed to
+other programs), and to an ordinary desktop notification otherwise. It
+is in the session's language where there is a translation, else English.
+
+GNOME. Plasma's pieces have GNOME counterparts: the eye key toggles
+Night Light (GNOME has no shortcut for it, so the key is handled here),
+an unassigned star key opens the keyboard settings, and the power-saver
+dimming goes through the extension's brightness methods, silently. The
+icons are swapped for Adwaita ones where the Breeze names do not exist.
 """
 import json
+import re
 import os
 import select
 import struct
@@ -77,11 +86,11 @@ MESSAGES = {
     "camera-off": ("camera-off", {
         "en": "Camera off", "sk": "Kamera vypnutá", "cs": "Kamera vypnuta",
         "de": "Kamera aus"}),
-    "performance": ("power-profile-performance-symbolic", {
+    "performance": ("battery-profile-performance", {
         "en": "Performance", "sk": "Výkon", "cs": "Výkon", "de": "Leistung"}),
-    "balanced": ("power-profile-balanced-symbolic", {
+    "balanced": ("battery-profile-balanced", {
         "en": "Balanced", "sk": "Vyvážený", "cs": "Vyvážený", "de": "Ausgeglichen"}),
-    "low-power": ("power-profile-power-saver-symbolic", {
+    "low-power": ("battery-profile-powersave", {
         "en": "Power saver", "sk": "Úspora energie", "cs": "Úspora energie",
         "de": "Energiesparen"}),
     "unassigned": ("input-keyboard", {
@@ -97,6 +106,12 @@ MESSAGES = {
         "en": "Game", "sk": "Hra", "cs": "Hra", "de": "Spiel"}),
     "neutral": ("audio-speakers-symbolic", {
         "en": "Neutral", "sk": "Neutrálny", "cs": "Neutrální", "de": "Neutral"}),
+    "night-on": ("night-light-symbolic", {
+        "en": "Night Light on", "sk": "Nočné svetlo zapnuté",
+        "cs": "Noční světlo zapnuto", "de": "Nachtlicht an"}),
+    "night-off": ("night-light-symbolic", {
+        "en": "Night Light off", "sk": "Nočné svetlo vypnuté",
+        "cs": "Noční světlo vypnuto", "de": "Nachtlicht aus"}),
     "speakers-only": ("audio-speakers-symbolic", {
         "en": "Sound modes apply to the speakers only",
         "sk": "Zvukové režimy platia len pre reproduktory",
@@ -104,6 +119,16 @@ MESSAGES = {
         "de": "Klangmodi gelten nur für die Lautsprecher"}),
 }
 SCANS = {SCAN_CAMERA_ON: "camera-on", SCAN_CAMERA_OFF: "camera-off"}
+# The icons above are Breeze names; where Adwaita (GNOME) has none of them.
+GNOME_ICONS = {"camera-on": "camera-photo-symbolic",
+               "camera-off": "camera-disabled-symbolic",
+               "unassigned": "input-keyboard-symbolic",
+               "music": "audio-x-generic-symbolic",
+               "movie": "camera-video-symbolic",
+               "game": "input-gaming-symbolic",
+               "performance": "power-profile-performance-symbolic",
+               "balanced": "power-profile-balanced-symbolic",
+               "low-power": "power-profile-power-saver-symbolic"}
 
 # Star keys: evdev key code -> Qt key code, as Plasma stores the shortcut
 # (read back from kglobalaccel after assigning the keys by hand).
@@ -111,6 +136,14 @@ KEY_PROG1, KEY_FAVORITES = 148, 364
 STAR_KEYS = {KEY_PROG1: 16777379,       # Qt::Key_Launch1, "Launch (1)"
              KEY_FAVORITES: 16777361}   # Qt::Key_Favorites
 KGLOBALACCEL = ("org.kde.kglobalaccel", "/kglobalaccel", "org.kde.KGlobalAccel")
+# The same keys as GNOME names them (xkb keysyms).
+STAR_KEYSYMS = {KEY_PROG1: "Launch1", KEY_FAVORITES: "Favorites"}
+MEDIA_KEYS = "org.gnome.settings-daemon.plugins.media-keys"
+
+# Eye key. Plasma: the installer gives it the Night Color shortcut and KWin
+# runs it. GNOME has no shortcut for Night Light, so the key is handled here.
+KEY_PROG3 = 202
+NIGHT_LIGHT = ("org.gnome.settings-daemon.plugins.color", "night-light-enabled")
 
 # Sound mode key and the filters the soundmodes step installs.
 KEY_PROG2 = 149
@@ -160,25 +193,57 @@ def brightness_set(value):
     busctl(*BRIGHTNESS, "setBrightnessSilent", "i", str(value))
 
 
+GNOME_OSD = ("org.gnome.Shell", "/io/github/RobertBozik/YogaOsd",
+             "io.github.RobertBozik.YogaOsd")
+
+
+def gnome_brightness():
+    """GNOME's brightness slider (0..1) through the Shell extension, or None."""
+    out = busctl_out(*GNOME_OSD, "GetBrightness")
+    try:
+        value = float(out.split()[1])
+    except (AttributeError, IndexError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
 class Dimmer:
     """Dims the screen in low-power and undoes it afterwards."""
 
     def __init__(self):
         self.saved = self.dimmed_to = None
+        self.gnome = False
 
     def enter(self):
         now = brightness_get("brightness")
         if now is None:
-            return                      # not Plasma: leave the screen alone
+            self.enter_gnome()
+            return
         floor = brightness_get("knownSafeBrightnessMin") or 1
         target = max(floor, round(now * (1 - DIM)))
         if target >= now:
             return
         brightness_set(target)
-        self.saved, self.dimmed_to = now, target
+        self.saved, self.dimmed_to, self.gnome = now, target, False
+
+    def enter_gnome(self):
+        now = gnome_brightness()
+        if now is None:
+            return                      # neither Plasma nor GNOME: leave it
+        target = max(0.05, now * (1 - DIM))
+        if target >= now:
+            return
+        busctl(*GNOME_OSD, "SetBrightness", "d", "%.4f" % target)
+        self.saved, self.dimmed_to, self.gnome = now, target, True
 
     def leave(self):
         if self.saved is None:
+            return
+        if self.gnome:
+            now = gnome_brightness()
+            if now is not None and abs(now - self.dimmed_to) <= 0.01:
+                busctl(*GNOME_OSD, "SetBrightness", "d", "%.4f" % self.saved)
+            self.saved = self.dimmed_to = None
             return
         now = brightness_get("brightness")
         top = brightness_get("brightnessMax") or 100
@@ -194,15 +259,54 @@ def show(message):
     if busctl("org.kde.plasmashell", "/org/kde/osdService",
               "org.kde.osdService", "showText", "ss", icon, text):
         return
+    # GNOME: the same bubble, shown by the yoga-slim-9 Shell extension.
+    if busctl("org.gnome.Shell", "/io/github/RobertBozik/YogaOsd",
+              "io.github.RobertBozik.YogaOsd", "ShowText", "ss",
+              GNOME_ICONS.get(message, icon), text):
+        return
     # Notify(app_name, replaces_id, icon, summary, body, actions, hints, timeout)
     busctl("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
            "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
            "yoga-hotkeys", "0", icon, text, "", "0", "0", "2000")
 
 
-def star_key(qt_key):
+def gnome_key_assigned(keysym):
+    """Does a GNOME shortcut - built-in or custom - use this key?"""
+    # GNOME stores the key as 'Favorites' or 'XF86Favorites', possibly with
+    # modifiers in front ('<Ctrl>Favorites'); match the whole key name.
+    key = re.compile(r"(^|[\s\[,'\">])(XF86)?%s(?=['\"\],\s]|$)" % keysym)
+    # Built-in ones live in several schemas (shell, mutter, window manager,
+    # media keys); the custom ones are relocatable and not listed there.
+    for line in (run_out("gsettings", "list-recursively") or "").splitlines():
+        schema, _, rest = line.partition(" ")
+        if ("keybindings" in schema or "media-keys" in schema) and key.search(rest):
+            return True
+    paths = run_out("gsettings", "get", MEDIA_KEYS, "custom-keybindings") or ""
+    for path in paths.replace("@as", "").strip(" []\n").split(","):
+        path = path.strip().strip("'")
+        if not path:
+            continue
+        binding = run_out("gsettings", "get",
+                          MEDIA_KEYS + ".custom-keybinding:" + path, "binding") or ""
+        if key.search(binding):
+            return True
+    return False
+
+
+def star_key(code):
     """A star key was pressed: if nothing uses it, open the settings."""
-    out = busctl_out(*KGLOBALACCEL, "getGlobalShortcutsByKey", "i", str(qt_key))
+    if gnome_shell():
+        if gnome_key_assigned(STAR_KEYSYMS[code]):
+            return                      # GNOME runs the shortcut
+        show("unassigned")
+        try:
+            subprocess.Popen(["gnome-control-center", "keyboard"],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            pass
+        return
+    out = busctl_out(*KGLOBALACCEL, "getGlobalShortcutsByKey", "i", str(STAR_KEYS[code]))
     if out is None or not out.startswith("a(ssssssaiai) 0"):
         return                          # not Plasma, or Plasma runs the shortcut
     show("unassigned")
@@ -213,6 +317,24 @@ def star_key(qt_key):
             return
         except OSError:
             continue
+
+
+def gnome_shell():
+    out = busctl_out("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                     "org.freedesktop.DBus", "NameHasOwner", "s", "org.gnome.Shell")
+    return out is not None and out.strip() == "b true"
+
+
+def eye_key():
+    """The eye key on GNOME: toggle Night Light and say so."""
+    if not gnome_shell():
+        return                          # Plasma: KWin runs the shortcut
+    cur = run_out("gsettings", "get", *NIGHT_LIGHT)
+    if cur is None:
+        return
+    new = "false" if cur.strip() == "true" else "true"
+    if run_out("gsettings", "set", *NIGHT_LIGHT, new) is not None:
+        show("night-on" if new == "true" else "night-off")
 
 
 def run_out(*cmd):
@@ -349,18 +471,25 @@ def main():
                 if etype == EV_MSC and code == MSC_SCAN and value in SCANS:
                     show(SCANS[value])
                 elif etype == EV_KEY and value == 1 and code in STAR_KEYS:
-                    star_key(STAR_KEYS[code])
+                    star_key(code)
                 elif etype == EV_KEY and value == 1 and code == KEY_PROG2:
                     sound_mode_key()
+                elif etype == EV_KEY and value == 1 and code == KEY_PROG3:
+                    eye_key()
             elif profile is not None and fd == profile.fileno():
                 now = read_profile(profile)
                 if now != last_profile:
-                    if now in MESSAGES:
+                    # On GNOME brightness first: the message has to be the
+                    # last thing in the one OSD bubble.
+                    gnome = gnome_shell()
+                    if now in MESSAGES and not gnome:
                         show(now)
                     if now == "low-power":
                         dimmer.enter()
                     elif last_profile == "low-power":
                         dimmer.leave()
+                    if now in MESSAGES and gnome:
+                        show(now)
                 last_profile = now
 
 

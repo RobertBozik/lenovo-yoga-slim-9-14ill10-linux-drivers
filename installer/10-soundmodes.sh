@@ -72,7 +72,10 @@ case "$ACTION" in
 install)
 	need_root
 	pkg_installed lsp-plugins-lv2 || die "lsp-plugins-lv2 missing (step: packages)"
-	pkg_installed libspa-0.2-modules-extra || die "libspa-0.2-modules-extra missing (step: packages)"
+	# PipeWire's LV2 support: libspa-0.2-modules-extra on Ubuntu,
+	# pipewire-module-filter-chain-lv2 on Fedora.
+	pkg_installed "libspa-0.2-modules-extra|pipewire-module-filter-chain-lv2" ||
+		die "PipeWire LV2 support missing (libspa-0.2-modules-extra / pipewire-module-filter-chain-lv2)"
 
 	before="$(default_sink)"
 	before_vol="$(volume_of "$(node_id "$before")" || true)"

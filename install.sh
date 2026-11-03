@@ -13,6 +13,15 @@
 # how to install, uninstall and check itself, so a step can be re-run at
 # any time. See uninstall.sh for the reverse.
 #
+# Supported, each with its own settings where the two differ:
+#   Kubuntu (Plasma)              - what this was developed on
+#   Fedora Workstation (GNOME)    - packages from dnf and RPM Fusion, the
+#                                   mask and the messages through a GNOME
+#                                   Shell extension
+# The platform is detected (distribution from /etc/os-release, desktop from
+# the session that is running); OV32C4_PLATFORM=kubuntu|fedora-gnome
+# overrides it.
+#
 # What this machine needs:
 #   packages   build dependencies
 #   driver     out-of-tree ov32c4 sensor driver + patched ipu-bridge, via DKMS
@@ -84,7 +93,49 @@ TARGET_USER="${SUDO_USER:-}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 KVER="$(uname -r)"
 
-export REPO STEPS_DIR TARGET_USER TARGET_HOME KVER
+# Which distribution and desktop - the steps differ between them.
+detect_platform() {
+	local id="" like="" distro desktop
+	# shellcheck disable=SC1091
+	[ -r /etc/os-release ] && { id="$(. /etc/os-release && echo "${ID:-}")"; like="$(. /etc/os-release && echo "${ID_LIKE:-}")"; }
+	case " $id $like " in
+	*" fedora "*) distro=fedora ;;
+	*" ubuntu "* | *" debian "*) distro=ubuntu ;;
+	*) distro="${id:-unknown}" ;;
+	esac
+	# The desktop of the user's running session; from a TTY, what is
+	# installed.
+	if pgrep -u "$TARGET_USER" -x plasmashell >/dev/null 2>&1; then
+		desktop=plasma
+	elif pgrep -u "$TARGET_USER" -x gnome-shell >/dev/null 2>&1; then
+		desktop=gnome
+	elif command -v plasmashell >/dev/null 2>&1; then
+		desktop=plasma
+	elif command -v gnome-shell >/dev/null 2>&1; then
+		desktop=gnome
+	else
+		desktop=unknown
+	fi
+	case "$distro:$desktop" in
+	ubuntu:plasma) echo kubuntu ;;
+	fedora:gnome) echo fedora-gnome ;;
+	*) echo "unsupported:$distro:$desktop" ;;
+	esac
+}
+
+PLATFORM="${OV32C4_PLATFORM:-$(detect_platform)}"
+case "$PLATFORM" in
+kubuntu | fedora-gnome) ;;
+*)
+	echo "This installer supports Kubuntu (Plasma) and Fedora Workstation (GNOME)." >&2
+	echo "This system looks like: ${PLATFORM#unsupported:} (distribution:desktop)." >&2
+	echo "Other combinations are not done yet. OV32C4_PLATFORM=kubuntu or" >&2
+	echo "OV32C4_PLATFORM=fedora-gnome forces one of the two, at your own risk." >&2
+	exit 1
+	;;
+esac
+
+export REPO STEPS_DIR TARGET_USER TARGET_HOME KVER PLATFORM
 
 # Sanity: this is written for one laptop. Warn, but let people try.
 PRODUCT="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
@@ -116,6 +167,8 @@ if [ "$ACTION" = uninstall ]; then
 	rev=(); for ((i = ${#run[@]} - 1; i >= 0; i--)); do rev+=("${run[$i]}"); done
 	run=("${rev[@]}")
 fi
+
+printf '%splatform: %s%s\n' "$BOLD" "$PLATFORM" "$OFF"
 
 failed=()
 for s in "${run[@]}"; do
@@ -154,5 +207,13 @@ EOF
 	fi
 	if [ ! -f "$TARGET_HOME/.config/udc-mask.json" ]; then
 		echo "  python3 /usr/local/bin/udc-mask.py --calibrate    # once, to place the dot"
+	fi
+	if [ "$PLATFORM" = fedora-gnome ]; then
+		for s in "${run[@]}"; do
+			case "$s" in mask | hotkeys)
+				echo "  GNOME loads the extension with the mask and the messages at the next login."
+				break ;;
+			esac
+		done
 	fi
 fi

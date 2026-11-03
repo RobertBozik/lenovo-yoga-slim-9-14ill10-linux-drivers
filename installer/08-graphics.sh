@@ -16,6 +16,9 @@ GRUB=/etc/default/grub
 # and the user's file is not rewritten. Earlier versions of this step
 # appended them to GRUB_CMDLINE_LINUX_DEFAULT in /etc/default/grub, and
 # a value with nothing in it came out mangled.
+#
+# Fedora's grub2-mkconfig does not read grub.d, and its boot entries are
+# BLS files; there grubby adds the parameters to every installed kernel.
 DROPIN=/etc/default/grub.d/ov32c4-xe.cfg
 PARAMS="xe.enable_psr=0 xe.enable_panel_replay=0"
 
@@ -33,6 +36,37 @@ strip_legacy() {
 	done
 	[ $changed = 0 ] || info "moved the parameters out of $GRUB (backup: $GRUB.ov32c4.bak)"
 }
+
+# Fedora: grubby, on all installed kernels.
+fedora_graphics() {
+	local p ingrub=1 running=1
+	case "$1" in
+	install)
+		need_root
+		grubby --update-kernel=ALL --args="$PARAMS"
+		ok "added $PARAMS to the boot entries (grubby)"
+		info "takes effect after a reboot"
+		;;
+	uninstall)
+		need_root
+		grubby --update-kernel=ALL --remove-args="$PARAMS"
+		ok "parameters removed"
+		;;
+	check)
+		for p in $PARAMS; do
+			grubby --info=DEFAULT 2>/dev/null | grep -F "$p" >/dev/null || ingrub=0
+			grep -q "$p" /proc/cmdline || running=0
+		done
+		[ $ingrub = 1 ] && report "boot entry parameters" ok || { report "boot entry parameters" missing; exit 1; }
+		[ $running = 1 ] && report "active in this boot" ok || report "active in this boot" "TODO" "reboot pending"
+		;;
+	esac
+}
+
+if is_fedora; then
+	fedora_graphics "$ACTION"
+	exit 0
+fi
 
 case "$ACTION" in
 install)

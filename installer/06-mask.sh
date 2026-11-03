@@ -10,30 +10,18 @@
 # always-on-top window does the same. Black on OLED means the pixels
 # are off, so the result for the camera is the same.
 #
+# On GNOME a window cannot stay above the Shell's own UI (screenshot tool,
+# overview), so there the dot is drawn by a GNOME Shell extension
+# (tools/gnome-extension/) instead of the udc-mask service. udc-mask.py is
+# installed either way: --calibrate is how the position is found.
+#
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 BIN=/usr/local/bin/udc-mask.py
 UNIT=/etc/systemd/user/udc-mask.service
 
-case "$ACTION" in
-install)
-	need_root
-	python3 -c 'import PyQt6' 2>/dev/null || die "python3-pyqt6 missing (step: packages)"
-
-	# An older hand-made per-user unit would shadow the system one, and
-	# its enable symlink would be left dangling. Take it out of service
-	# first, so that systemd removes the symlink while the file is still
-	# there, and only then delete it.
-	old="$TARGET_HOME/.config/systemd/user/udc-mask.service"
-	if [ -e "$old" ]; then
-		info "replacing the per-user unit $old"
-		user_systemctl disable --now udc-mask.service
-		rm -f "$old"
-		user_systemctl daemon-reload
-	fi
-
-	install_file "$REPO/scripts/udc-mask.py" "$BIN" 755
-
+# The udc-mask service (Plasma): a small always-on-top window.
+install_service() {
 	tmp="$(mktemp)"
 	cat >"$tmp" <<EOF
 [Unit]
@@ -55,12 +43,45 @@ EOF
 
 	user_systemctl daemon-reload
 	user_systemctl enable --now udc-mask.service
+}
+
+case "$ACTION" in
+install)
+	need_root
+	python3 -c 'import PyQt6' 2>/dev/null || die "python3-pyqt6 missing (step: packages)"
+
+	# An older hand-made per-user unit would shadow the system one, and
+	# its enable symlink would be left dangling. Take it out of service
+	# first, so that systemd removes the symlink while the file is still
+	# there, and only then delete it.
+	old="$TARGET_HOME/.config/systemd/user/udc-mask.service"
+	if [ -e "$old" ]; then
+		info "replacing the per-user unit $old"
+		user_systemctl disable --now udc-mask.service
+		rm -f "$old"
+		user_systemctl daemon-reload
+	fi
+
+	install_file "$REPO/scripts/udc-mask.py" "$BIN" 755
+
+	if is_gnome; then
+		# The extension draws the dot; the service would only add a second
+		# one that GNOME keeps under its own UI.
+		if [ -e "$UNIT" ]; then
+			user_systemctl disable --now udc-mask.service
+			remove_file "$UNIT"
+			user_systemctl daemon-reload
+		fi
+		gnome_ext_install
+	else
+		install_service
+	fi
 
 	cfg="$TARGET_HOME/.config/udc-mask.json"
 	if [ -f "$cfg" ] && grep -q '"calibrated": *true' "$cfg"; then
-		ok "mask service running, position already calibrated"
+		ok "mask installed, position already calibrated"
 	else
-		ok "mask service installed"
+		ok "mask installed"
 		info "calibrate once (white screen, arrows move the dot, Enter saves):"
 		info "  python3 $BIN --calibrate"
 	fi
@@ -68,7 +89,15 @@ EOF
 
 uninstall)
 	need_root
-	user_systemctl disable --now udc-mask.service
+	if is_gnome; then
+		# The hotkeys service shows its messages through the same extension.
+		if [ -e /usr/local/bin/yoga-hotkeys ]; then
+			info "GNOME extension kept - the hotkeys step uses it too"
+		else
+			gnome_ext_remove
+		fi
+	fi
+	[ -e "$UNIT" ] && user_systemctl disable --now udc-mask.service
 	remove_file "$UNIT"
 	remove_file "$BIN"
 	user_systemctl daemon-reload
@@ -77,7 +106,9 @@ uninstall)
 
 check)
 	[ -x "$BIN" ] && report "mask program" ok || { report "mask program" missing; exit 1; }
-	if as_user systemctl --user is-active udc-mask.service >/dev/null 2>&1; then
+	if is_gnome; then
+		gnome_ext_check
+	elif as_user systemctl --user is-active udc-mask.service >/dev/null 2>&1; then
 		report "mask service" ok
 	else
 		report "mask service" missing "needs a graphical session"

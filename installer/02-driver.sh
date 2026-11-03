@@ -3,9 +3,9 @@
 #
 # ov32c4 sensor driver and patched ipu-bridge, built by DKMS
 #
-# Both modules land in /lib/modules/<kernel>/updates/dkms/, which depmod
-# prefers over the distribution ones, and DKMS rebuilds them for every new
-# kernel. The sensor driver is ours (upstream submission in upstream/);
+# Both modules land in /lib/modules/<kernel>/updates/dkms/ (Ubuntu) or
+# extra/ (Fedora's DKMS ignores DEST_MODULE_LOCATION), which depmod prefers
+# over the distribution ones, and DKMS rebuilds them for every new kernel. The sensor driver is ours (upstream submission in upstream/);
 # ipu-bridge is the kernel's own file with the sensor entry and a VCM
 # exception added, see vendor/ipu-bridge/README.md.
 #
@@ -53,9 +53,12 @@ install)
 		p="$(modinfo -n "$m" -k "$KVER" 2>/dev/null || true)"
 		case "$p" in
 		*/updates/dkms/*) ok "$m -> $p" ;;
+		*/extra/*) if is_fedora; then ok "$m -> $p"; else die "$m resolves to $p, not to the DKMS module"; fi ;;
 		*) die "$m does not resolve to the DKMS module ($p)" ;;
 		esac
 	done
+	# Fedora's DKMS signs with a key of its own, made on the first build.
+	is_fedora && mok_enroll /var/lib/dkms/mok.pub "the camera driver (DKMS)"
 	info "the modules are not swapped while running - reboot to use them"
 	;;
 

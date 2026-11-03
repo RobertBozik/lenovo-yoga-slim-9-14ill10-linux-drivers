@@ -22,6 +22,10 @@
 # only if it is still the one set here. The two star keys are left for
 # the user to assign; until they are, a press opens the shortcut settings.
 #
+# On GNOME the service handles the eye key itself (Night Light), and its
+# messages and the power-saver dimming go through the GNOME Shell
+# extension, which this step installs as well (it also draws the mask).
+#
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 SRC="$REPO/tools/hotkeys"
@@ -120,12 +124,21 @@ install)
 	user_systemctl enable yoga-hotkeys.service
 	user_systemctl restart yoga-hotkeys.service
 	ok "hotkey messages installed"
-	set_night_color_shortcut
+	if is_gnome; then
+		gnome_ext_install
+		info "GNOME: the eye key toggles Night Light (handled by the service)"
+	else
+		set_night_color_shortcut
+	fi
 	;;
 
 uninstall)
 	need_root
 	user_systemctl disable --now yoga-hotkeys.service
+	# The extension also draws the mask; it goes with the mask step.
+	if is_gnome && [ ! -e /usr/local/bin/udc-mask.py ]; then
+		gnome_ext_remove
+	fi
 	unset_night_color_shortcut
 	remove_file "$UNIT"
 	remove_file "$BIN"
@@ -144,6 +157,11 @@ check)
 		report "hotkeys service" ok
 	else
 		report "hotkeys service" missing "needs a graphical session"
+	fi
+	if is_gnome; then
+		gnome_ext_check
+		report "eye key: Night Light" ok "handled by yoga-hotkeys"
+		exit 0
 	fi
 	case "$(night_color_keys)" in
 	"$NC_OURS") report "eye key: Night Color" ok ;;
